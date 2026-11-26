@@ -150,14 +150,14 @@ cat > "$BUNDLE/Info.plist" <<'PLIST'
 PLIST
 
 echo "[HakiosMetal] Linking HakiosMetal.bundle..."
-# Put metal/tbd after SDK frameworks so private _MTL* class stubs resolve cleanly even on public SDKs
+# Put metal/tbd/Metal.tbd alongside SDK frameworks so private _MTL* class stubs resolve cleanly even on public SDKs
 # shellcheck disable=SC2086
 "$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" ${EXTRA_FLAGS:-} $LD_EXTRA \
 	-bundle -o "$BUNDLE/HakiosMetal" \
 	"$WORK/HakiosMetalCA.o" "$WORK/libhakios-metal.a" "${MESA_ARCHIVES[@]}" \
-	-L"$HERE/tbd" -lMetal \
+	"$HERE/tbd/Metal.tbd" \
 	-framework CoreFoundation -framework Foundation -framework IOKit -framework IOSurface -framework Metal \
-	-lobjc -lc++ -lz -lm
+	-lobjc -lz -lm
 
 if command -v codesign >/dev/null 2>&1; then
 	codesign --force --sign - "$BUNDLE"

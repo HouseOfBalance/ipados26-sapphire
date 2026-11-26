@@ -171,15 +171,15 @@ def lookup_bsd_hash_db(blob: bytes, key: bytes) -> bytes | None:
 
 def _pack_record(fields: list[str], shadow: bool) -> tuple[int, bytes]:
     name, pw, uid_s, gid_s, pw_class, change_s, expire_s, gecos, home, shell = fields
-    uid = int(uid_s)
-    gid = int(gid_s)
+    uid = int(uid_s) & 0xFFFFFFFF
+    gid = int(gid_s) & 0xFFFFFFFF
     change = int(change_s) if change_s else 0
     expire = int(expire_s) if expire_s else 0
     pw_out = pw if (shadow or not pw) else "*"
     rec = bytearray()
     rec += name.encode("utf-8") + b"\x00"
     rec += pw_out.encode("utf-8") + b"\x00"
-    rec += struct.pack("<iiq", uid, gid, change)
+    rec += struct.pack("<IIq", uid, gid, change)
     rec += pw_class.encode("utf-8") + b"\x00"
     rec += gecos.encode("utf-8") + b"\x00"
     rec += home.encode("utf-8") + b"\x00"
@@ -258,13 +258,14 @@ def _selftest() -> None:
         "toor:*:0:0::0:0:Bourne-again Superuser:/var/root:/bin/sh\n"
         "mobile:sa3tHJ3/KuYvI:501:501::0:0:Mobile User:/var/mobile:/bin/sh\n"
         "nobody:*:-2:-2::0:0:Unprivileged User:/var/empty:/usr/bin/false\n"
+        "nogroup:*:4294967294:4294967294::0:0:Unprivileged Group:/var/empty:/usr/bin/false\n"
     )
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, "master.passwd")
         with open(mp, "w", encoding="utf-8") as f:
             f.write(sample)
         n = generate_pwdb(mp, td)
-        assert n == 4, n
+        assert n == 5, n
         pdb = open(os.path.join(td, "pwd.db"), "rb").read()
         sdb = open(os.path.join(td, "spwd.db"), "rb").read()
         # Lookup root by name, entry #1, and uid 0 (R_NOOVERWRITE -> root wins over toor)
