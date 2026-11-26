@@ -34,10 +34,10 @@ else
 	LINK_ARGS="['-fuse-ld=lld']"
 fi
 mkdir -p "$B/out" && cd "$B"
-PATCHES=$(cat "$HERE"/mesa/*.patch | sha256sum | cut -d' ' -f1)
+PATCHES=$(cat "$HERE"/mesa/*.patch | (shasum -a 256 2>/dev/null || sha256sum) | awk '{print $1}')
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.sapphire-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
-	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
+	echo "$SHA256  mesa-$VERSION.tar.xz" | (shasum -a 256 -c >/dev/null 2>&1 || sha256sum -c >/dev/null)
 	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
 	for p in "$HERE"/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
