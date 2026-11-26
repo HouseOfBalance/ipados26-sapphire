@@ -54,14 +54,6 @@ if [[ -z "$jb_cache" ]]; then
 fi
 mkdir -p "$jb_cache"
 
-# 1. Build Procursus + Sileo + ElleKit + OpenSSH tree via userland/jb/mk-jb.sh if not cached
-if [[ ! -x "$jb_cache/root/var/jb/usr/sbin/sshd" ]]; then
-	echo "[JB 1/5] Fetching & staging Procursus + Sileo + ElleKit + OpenSSH into $jb_cache..."
-	JB_OUT="$jb_cache" bash "$repo/userland/jb/mk-jb.sh"
-else
-	echo "[JB 1/5] Reusing cached Procursus tree at $jb_cache/root/var/jb"
-fi
-
 mnt=""
 cleanup() {
 	if [[ $mounted_mode -eq 0 && -n "$mnt" ]]; then
@@ -84,6 +76,15 @@ fi
 
 test -d "$mnt/private/var"
 jb="$mnt/private/var/jb"
+
+# 1. Build Procursus + Sileo + ElleKit + OpenSSH tree via userland/jb/mk-jb.sh if not cached
+# (Run inside subshell so mk-jb.sh's own trap EXIT does not clobber our cleanup trap!)
+if [[ ! -x "$jb_cache/root/var/jb/usr/sbin/sshd" ]]; then
+	echo "[JB 1/5] Fetching & staging Procursus + Sileo + ElleKit + OpenSSH into $jb_cache..."
+	( JB_OUT="$jb_cache" bash "$repo/userland/jb/mk-jb.sh" )
+else
+	echo "[JB 1/5] Reusing cached Procursus tree at $jb_cache/root/var/jb"
+fi
 
 echo "[JB 2/5] Installing /private/var/jb, /Applications, and /bin real binaries..."
 rm -rf "$jb"
