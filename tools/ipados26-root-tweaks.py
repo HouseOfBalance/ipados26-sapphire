@@ -38,14 +38,18 @@ DISABLED_DAEMON_SUBSTRINGS = (
 
 
 def chown_safe(path, uid, gid, follow_symlinks=True):
-    if follow_symlinks:
-        if hasattr(os, 'chown'):
-            os.chown(path, uid, gid)
-    elif hasattr(os, 'lchown'):
-        try:
+    try:
+        if follow_symlinks:
+            if hasattr(os, 'chown'):
+                os.chown(path, uid, gid)
+        elif hasattr(os, 'lchown'):
             os.lchown(path, uid, gid)
-        except OSError:
-            pass
+    except PermissionError:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            raise
+    except OSError:
+        if follow_symlinks and hasattr(os, 'geteuid') and os.geteuid() == 0:
+            raise
 
 
 def load(path):
