@@ -1,0 +1,98 @@
+# CircleCI macOS build for iPadOS 26.1 XNU Kernel (xnu-12377.41.6, 4 KiB 8-core AMP) on Redmi Note 13 4G (sapphire)
+version: 2.1
+
+parameters:
+  build_kernel:
+    type: boolean
+    default: false
+  xcode_version:
+    type: string
+    default: "16.4.0"
+
+jobs:
+  xnu-ipados26-4k:
+    macos:
+      # Supported deterministic Xcode images on CircleCI m4pro.medium: 16.4.0 / 16.2.0
+      xcode: << pipeline.parameters.xcode_version >>
+    resource_class: m4pro.medium
+    environment:
+      DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+      MACOS_VERSION: "26.1"
+      KERNEL_CONFIG: DEVELOPMENT
+      MACHINE_CONFIG: SWEET
+      MAKEFLAGS: -k
+      TOPAZ_4K: "1"
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - checkout
+      - run:
+          name: Run automated unit tests
+          command: python3 -B tests/run_unit_tests.py
+      - restore_cache:
+          keys:
+            - ccache-xnu-ipados26-4k-
+      - run:
+          name: Fetch darwin-xnu-build & stage iPadOS 26.1 patches
+          command: |
+            set -e
+            git clone --depth 1 "$DXB_REPO" dxb
+            rm -rf "dxb/patches/${MACOS_VERSION}"
+            mkdir -p "dxb/patches/${MACOS_VERSION}"
+            cp xnu/patches-ipados26/*.sh xnu/patches-ipados26/*.patch "dxb/patches/${MACOS_VERSION}/"
+            chmod +x "dxb/patches/${MACOS_VERSION}/"*.sh
+            sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
+            sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh
+      - run:
+          name: Install dependencies & ccache wrapper
+          command: |
+            set -e
+            sw_vers
+            DEV_DIR="$(xcode-select -p)"
+            export DEVELOPER_DIR="$DEV_DIR"
+            echo "export DEVELOPER_DIR=\"$DEV_DIR\"" >> "$BASH_ENV"
+            echo "DEVELOPER_DIR=$DEV_DIR"
+            xcodebuild -version
+            xcrun clang --version
+            clang --version
+            pip3 install --break-system-packages cmake ninja || pip3 install cmake ninja
+            for t in gum xcodes; do
+              command -v $t || { sudo mkdir -p /usr/local/bin; printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/$t >/dev/null; sudo chmod +x /usr/local/bin/$t; }
+            done
+            wrap="$PWD/ccache-bin"
+            mkdir -p "$wrap"
+            cc=$(command -v ccache || true)
+            for t in clang clang++; do
+              printf '#!/bin/sh\nfor a; do case "$a" in *.s) exec %s "$@";; esac; done\nexec %s %s "$@"\n' "$(xcrun -find $t)" "$cc" "$(xcrun -find $t)" > "$wrap/$t"
+              chmod +x "$wrap/$t"
+            done
+      - run:
+          name: Build XNU 26.1 (4K AMP)
+          no_output_timeout: 60m
+          command: |
+            set -e
+            export CCACHE_DIR="$PWD/.ccache" CCACHE_BASEDIR="$PWD" CCACHE_WRAP="$PWD/ccache-bin"
+            cd dxb
+            command -v ccache >/dev/null && ccache -z
+            bash build.sh
+            command -v ccache >/dev/null && ccache -s || true
+      - save_cache:
+          key: ccache-xnu-ipados26-4k-{{ .BuildNum }}
+          paths:
+            - .ccache
+      - run:
+          name: Collect kernel artifact
+          command: |
+            mkdir -p out
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/
+            (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+            ls -la out
+      - store_artifacts:
+          path: out
+
+workflows:
+  kernel:
+    when: << pipeline.parameters.build_kernel >>
+    jobs:
+      - xnu-ipados26-4k

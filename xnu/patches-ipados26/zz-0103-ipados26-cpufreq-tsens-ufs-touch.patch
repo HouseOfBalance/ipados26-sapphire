@@ -1,0 +1,610 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index b863e35..21e8e6e 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1,12 +1,27 @@
+ /*
+- * topaz: run the Gold cluster at its top frequency. SM6225 cpufreq-hw
+- * (qcom,cpufreq-hw, freq-domain1 at 0xf523000; msm-4.19 qcom-cpufreq-hw.c
+- * layout): LUT at +0x110, 32-byte rows, PERF_STATE at +0x920.
+- * sapphire 0216: the Silver cluster too (freq-domain0 at 0xf521000), now
+- * that a 4 KiB-page kernel runs it as the E cluster.
+- * sapphire 0328: full 40-row LUT (Snapdragon 685 upper OPPs up to 2.80 GHz
+- * gold / 1.90 GHz silver sit past row 12) and kern.sweet_cpufreq sysctl.
+- * Nothing scales it down again: there is no XNU cpufreq driver yet.
++ * Sapphire (Snapdragon 685 / SM6225Pro "khaje") Dynamic CPUFreq (OSM) & TSENS0 Thermal Driver.
++ *
++ * Hardware blocks:
++ *   - Qualcomm OSM cpufreq-hw:
++ *       Silver cluster (Kryo 260 Silver, CPUs 0-3): 0x0f521000 (LUT +0x110, PERF_STATE +0x920)
++ *       Gold cluster   (Kryo 260 Gold,   CPUs 4-7): 0x0f523000 (LUT +0x110, PERF_STATE +0x920)
++ *       40-row LUT up to 2.80 GHz Gold / 1.90 GHz Silver.
++ *   - Qualcomm TSENS0 v2.3 silicon thermal sensors:
++ *       TSENS0_SROT: 0x04410000 (SROT_CTRL +0x04 bit 0 = TSENS_EN)
++ *       TSENS0_TM:   0x04411000 (TM_SN_STATUS +0x00a0 + 4*i, bit 21 = VALID, [11:0] signed 0.1 C)
++ *
++ * Exports sysctls matching userland/thermal/thermald.c & dynamic power management:
++ *   - kern.sweet_cpufreq             (RW string: status; write "max"/"eco"/"balance"/kHz)
++ *   - kern.sweet_cpu_max_freq        (RW int kHz: caps Gold & Silver OSM PERF_STATE)
++ *   - kern.sweet_gpu_max_freq        (RW int Hz:  thermal GPU ceiling)
++ *   - kern.sweet_touch_boost_enabled (RW int 0/1)
++ *   - kern.sweet_launch_boost_enabled(RW int 0/1)
++ *   - kern.sweet_tsens               (RD int mC:  live max silicon die temperature)
++ *   - kern.sweet_tsens_sensors       (RD string:  per-sensor silicon temperatures)
++ *   - kern.sweet_thermal_zone0..3    (RW int mC:  published thermal zone telemetry)
++ *   - kern.sweet_thermal_state       (RW int 0..3)
++ *   - kern.sweet_thermal_policy      (RW uint bitmask)
++ *   - kern.sweet_deep_sleep          (RW int 0/1)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -17,9 +32,12 @@
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+ #include <machine/machine_routines.h>
++#include <machine/atomic.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_cpufreq_max(void);
++void sweet_cpufreq_panel_notify(int awake);
++void sweet_cpufreq_touch_boost(void);
+ 
+ #define CPUFREQ_GOLD_PA         0x0f523000u
+ #define CPUFREQ_SILVER_PA       0x0f521000u
+@@ -28,31 +46,65 @@ int sweet_cpufreq_max(void);
+ #define CPUFREQ_PERF_STATE      0x920u
+ #define CPUFREQ_LUT_MAX         40
+ 
++#define TSENS0_SROT_PA          0x04410000u
++#define TSENS0_TM_PA            0x04411000u
++#define TSENS_SROT_CTRL         0x0004u
++#define TSENS_TM_SN_STATUS      0x00a0u
++#define TSENS_MAX_SENSORS       16
++#define TSENS_VALID_BIT         (1u << 21)
++
+ struct sweet_cpufreq_domain {
+ 	const char *name;
+-	uint32_t pa;
++	uint32_t    pa;
+ 	vm_offset_t base;
++	uint32_t    lut_khz[CPUFREQ_LUT_MAX];
++	uint32_t    lut_count;
++	uint32_t    max_row;
++	uint32_t    max_khz;
++	uint32_t    cur_row;
++	bool        lut_ready;
+ };
+ 
+ static struct sweet_cpufreq_domain cpufreq_domains[] = {
+-	{ "gold",   CPUFREQ_GOLD_PA,   0 },
+-	{ "silver", CPUFREQ_SILVER_PA, 0 },
++	{ "gold",   CPUFREQ_GOLD_PA,   0, { 0 }, 0, 0, 0, 0xffffffffu, false },
++	{ "silver", CPUFREQ_SILVER_PA, 0, { 0 }, 0, 0, 0, 0xffffffffu, false },
+ };
+ 
+ static LCK_GRP_DECLARE(sweet_cpufreq_grp, "sweet_cpufreq");
+ static LCK_MTX_DECLARE(sweet_cpufreq_lock, &sweet_cpufreq_grp);
+ 
+-static vm_offset_t
+-sweet_cpufreq_map_locked(struct sweet_cpufreq_domain *dom)
++static vm_offset_t tsens_srot_base;
++static vm_offset_t tsens_tm_base;
++
++int sweet_cpu_max_freq = 2803200;               /* kHz */
++int sweet_gpu_max_freq = 1113600000;            /* Hz */
++int sweet_touch_boost_enabled = 1;
++int sweet_launch_boost_enabled = 1;
++int sweet_thermal_zone0 = 0;
++int sweet_thermal_zone1 = 0;
++int sweet_thermal_zone2 = 0;
++int sweet_thermal_zone3 = 0;
++int sweet_thermal_state = 0;
++unsigned int sweet_thermal_policy = 0;
++int sweet_deep_sleep = 0;
++
++static int _Atomic cpufreq_panel_awake = 1;
++static int _Atomic cpufreq_at_target = 0;
++static int cpufreq_boot_checked = -1;
++
++static bool
++sweet_cpufreq_enabled(void)
+ {
+-	if (dom->base == 0) {
+-		dom->base = ml_io_map(dom->pa, 0x1000);
++	if (cpufreq_boot_checked < 0) {
++		int on = 1;
++		PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
++		cpufreq_boot_checked = (on != 0) ? 1 : 0;
+ 	}
+-	return dom->base;
++	return cpufreq_boot_checked != 0;
+ }
+ 
+ static uint32_t
+-sweet_cpufreq_lut_khz(vm_offset_t base, uint32_t row)
++sweet_cpufreq_hw_lut_khz(vm_offset_t base, uint32_t row)
+ {
+ 	if (row >= (uint32_t)CPUFREQ_LUT_MAX) {
+ 		return 0;
+@@ -62,33 +114,86 @@ sweet_cpufreq_lut_khz(vm_offset_t base, uint32_t row)
+ 	return src ? 19200u * lval : 300000u;
+ }
+ 
++static vm_offset_t
++sweet_cpufreq_map_locked(struct sweet_cpufreq_domain *dom)
++{
++	if (dom->base == 0) {
++		dom->base = ml_io_map(dom->pa, 0x1000);
++	}
++	if (dom->base != 0 && !dom->lut_ready) {
++		uint32_t prev = 0, best_row = 0, best_khz = 0, cnt = 0;
++		for (uint32_t i = 0; i < (uint32_t)CPUFREQ_LUT_MAX; i++) {
++			uint32_t khz = sweet_cpufreq_hw_lut_khz(dom->base, i);
++			if (i > 0 && khz == prev) {
++				break;  /* Qualcomm OSM repeats final valid OPP entry */
++			}
++			dom->lut_khz[i] = khz;
++			prev = khz;
++			cnt = i + 1;
++			if (khz > best_khz) {
++				best_khz = khz;
++				best_row = i;
++			}
++		}
++		if (cnt == 0) {
++			dom->lut_khz[0] = 300000u;
++			cnt = 1;
++			best_khz = 300000u;
++		}
++		dom->lut_count = cnt;
++		dom->max_row = best_row;
++		dom->max_khz = best_khz;
++		dom->cur_row = *(volatile uint32_t *)(dom->base + CPUFREQ_PERF_STATE);
++		dom->lut_ready = true;
++	}
++	return dom->base;
++}
++
+ static int
+-sweet_cpufreq_domain_max_locked(struct sweet_cpufreq_domain *dom)
++sweet_cpufreq_domain_set_cap_locked(struct sweet_cpufreq_domain *dom, uint32_t cap_khz, bool log_change)
+ {
+ 	vm_offset_t b = sweet_cpufreq_map_locked(dom);
+-	if (b == 0) {
++	if (b == 0 || dom->lut_count == 0) {
+ 		return -1;
+ 	}
+-	uint32_t best = 0, bestKHz = 0, prevKHz = 0;
+-	for (uint32_t i = 0; i < (uint32_t)CPUFREQ_LUT_MAX; i++) {
+-		uint32_t khz = sweet_cpufreq_lut_khz(b, i);
+-		if (i > 0 && khz == prevKHz) {
+-			break;          /* the LUT repeats its last entry */
+-		}
+-		prevKHz = khz;
+-		if (khz > bestKHz) {
+-			bestKHz = khz;
+-			best = i;
++	uint32_t target = 0;
++	if (cap_khz >= dom->max_khz) {
++		target = dom->max_row;
++	} else {
++		for (uint32_t i = 0; i < dom->lut_count; i++) {
++			if (dom->lut_khz[i] <= cap_khz) {
++				target = i;
++			}
+ 		}
+ 	}
++	if (dom->cur_row == target) {
++		return 0;
++	}
+ 	uint32_t old = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
++	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = target;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	printf("SWEET CPUFREQ: %s perf state %u -> %u (%u MHz)\n", dom->name, old, best, bestKHz / 1000u);
++	dom->cur_row = target;
++	if (log_change) {
++		printf("SWEET CPUFREQ: %s perf state %u -> %u (%u MHz)\n",
++		    dom->name, old, target, dom->lut_khz[target] / 1000u);
++	}
+ 	return 0;
+ }
+ 
++static int
++sweet_cpufreq_apply_cap_locked(uint32_t cap_khz, bool log_change)
++{
++	int rc = 0;
++	for (size_t i = 0; i < sizeof(cpufreq_domains) / sizeof(cpufreq_domains[0]); i++) {
++		int err = sweet_cpufreq_domain_set_cap_locked(&cpufreq_domains[i], cap_khz, log_change);
++		if (err != 0 && rc == 0) {
++			rc = err;
++		}
++	}
++	return rc;
++}
++
+ static int
+ sweet_cpufreq_domain_read_locked(struct sweet_cpufreq_domain *dom, uint32_t *state_out, uint32_t *mhz_out)
+ {
+@@ -97,11 +202,122 @@ sweet_cpufreq_domain_read_locked(struct sweet_cpufreq_domain *dom, uint32_t *sta
+ 		return -1;
+ 	}
+ 	uint32_t state = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
++	dom->cur_row = state;
+ 	*state_out = state;
+-	*mhz_out = sweet_cpufreq_lut_khz(b, state) / 1000u;
++	*mhz_out = (state < dom->lut_count ? dom->lut_khz[state] : sweet_cpufreq_hw_lut_khz(b, state)) / 1000u;
++	return 0;
++}
++
++int
++sweet_cpufreq_max(void)
++{
++	if (!sweet_cpufreq_enabled()) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	uint32_t cap = sweet_cpu_max_freq > 300000 ? (uint32_t)sweet_cpu_max_freq : 2803200u;
++	int rc = sweet_cpufreq_apply_cap_locked(cap, true);
++	os_atomic_store(&cpufreq_at_target, 1, relaxed);
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++	return rc;
++}
++
++void
++sweet_cpufreq_panel_notify(int awake)
++{
++	if (!sweet_cpufreq_enabled()) {
++		return;
++	}
++	os_atomic_store(&cpufreq_panel_awake, awake ? 1 : 0, relaxed);
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	if (!awake) {
++		/* Drop Gold & Silver to 300 MHz floor immediately while panel is blanked */
++		(void)sweet_cpufreq_apply_cap_locked(300000u, false);
++		os_atomic_store(&cpufreq_at_target, 0, relaxed);
++	} else {
++		uint32_t cap = sweet_cpu_max_freq > 0 ? (uint32_t)sweet_cpu_max_freq : 2803200u;
++		(void)sweet_cpufreq_apply_cap_locked(cap, false);
++		os_atomic_store(&cpufreq_at_target, 1, relaxed);
++	}
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++}
++
++void
++sweet_cpufreq_touch_boost(void)
++{
++	if (!sweet_touch_boost_enabled || !os_atomic_load(&cpufreq_panel_awake, relaxed) ||
++	    os_atomic_load(&cpufreq_at_target, relaxed)) {
++		return;
++	}
++	if (!sweet_cpufreq_enabled()) {
++		return;
++	}
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	uint32_t cap = sweet_cpu_max_freq > 0 ? (uint32_t)sweet_cpu_max_freq : 2803200u;
++	(void)sweet_cpufreq_apply_cap_locked(cap, false);
++	os_atomic_store(&cpufreq_at_target, 1, relaxed);
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++}
++
++/* ---------------------------------------------------------------- TSENS0 v2.3 */
++
++static bool
++sweet_tsens_map_locked(void)
++{
++	if (tsens_srot_base == 0) {
++		tsens_srot_base = ml_io_map(TSENS0_SROT_PA, 0x1000);
++	}
++	if (tsens_tm_base == 0) {
++		tsens_tm_base = ml_io_map(TSENS0_TM_PA, 0x1000);
++	}
++	if (tsens_srot_base == 0 || tsens_tm_base == 0) {
++		return false;
++	}
++	uint32_t ctrl = *(volatile uint32_t *)(tsens_srot_base + TSENS_SROT_CTRL);
++	return (ctrl & 1u) != 0;
++}
++
++static int
++sweet_tsens_read_sensor_mc(vm_offset_t tm, uint32_t idx, int *mc_out)
++{
++	if (idx >= TSENS_MAX_SENSORS) {
++		return -1;
++	}
++	uint32_t st = *(volatile uint32_t *)(tm + TSENS_TM_SN_STATUS + 4u * idx);
++	if (!(st & TSENS_VALID_BIT)) {
++		st = *(volatile uint32_t *)(tm + TSENS_TM_SN_STATUS + 4u * idx);
++		if (!(st & TSENS_VALID_BIT)) {
++			return -1;
++		}
++	}
++	int32_t deci_c = (int32_t)(st & 0xfffu);
++	if (deci_c & 0x800) {
++		deci_c -= 0x1000;
++	}
++	if (deci_c < -200 || deci_c > 1400) {
++		return -1;
++	}
++	*mc_out = deci_c * 100;
+ 	return 0;
+ }
+ 
++static int
++sweet_tsens_max_mc(void)
++{
++	int max_mc = -100000;
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	if (sweet_tsens_map_locked()) {
++		for (uint32_t i = 0; i < TSENS_MAX_SENSORS; i++) {
++			int mc = 0;
++			if (sweet_tsens_read_sensor_mc(tsens_tm_base, i, &mc) == 0 && mc > max_mc) {
++				max_mc = mc;
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++	return max_mc > -40000 ? max_mc : -1;
++}
++
+ static int
+ sweet_cpufreq_format(char *buf, size_t len)
+ {
+@@ -134,26 +350,6 @@ sweet_cpufreq_format(char *buf, size_t len)
+ 	return rc;
+ }
+ 
+-int
+-sweet_cpufreq_max(void)
+-{
+-	int on = 1;
+-	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
+-	if (!on) {
+-		return 0;
+-	}
+-	lck_mtx_lock(&sweet_cpufreq_lock);
+-	int rc = 0;
+-	for (size_t i = 0; i < sizeof(cpufreq_domains) / sizeof(cpufreq_domains[0]); i++) {
+-		int err = sweet_cpufreq_domain_max_locked(&cpufreq_domains[i]);
+-		if (err != 0 && rc == 0) {
+-			rc = err;
+-		}
+-	}
+-	lck_mtx_unlock(&sweet_cpufreq_lock);
+-	return rc;
+-}
+-
+ static int
+ sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
+ {
+@@ -165,13 +361,137 @@ sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
+ 	}
+ 	error = SYSCTL_OUT(req, out, strlen(out) + 1);
+ 	if (!error && req->newptr != USER_ADDR_NULL) {
+-		if (sweet_cpufreq_max() != 0) {
+-			return ENXIO;
++		char cmd[32];
++		bzero(cmd, sizeof(cmd));
++		size_t inlen = req->newlen < sizeof(cmd) - 1 ? req->newlen : sizeof(cmd) - 1;
++		if (SYSCTL_IN(req, cmd, inlen) == 0) {
++			if (strncmp(cmd, "max", 3) == 0) {
++				sweet_cpu_max_freq = 2803200;
++			} else if (strncmp(cmd, "eco", 3) == 0 || strncmp(cmd, "min", 3) == 0) {
++				sweet_cpu_max_freq = 600000;
++			} else if (strncmp(cmd, "bal", 3) == 0 || strncmp(cmd, "norm", 4) == 0) {
++				sweet_cpu_max_freq = 2400000;
++			} else if (cmd[0] >= '0' && cmd[0] <= '9') {
++				uint32_t v = 0;
++				for (size_t k = 0; k < inlen && cmd[k] >= '0' && cmd[k] <= '9'; k++) {
++					v = v * 10u + (uint32_t)(cmd[k] - '0');
++				}
++				if (v >= 300 && v <= 3000) {
++					sweet_cpu_max_freq = (int)(v * 1000u);
++				} else if (v >= 300000 && v <= 3000000) {
++					sweet_cpu_max_freq = (int)v;
++				}
++			}
++		}
++		if (sweet_cpufreq_enabled()) {
++			lck_mtx_lock(&sweet_cpufreq_lock);
++			uint32_t cap = (uint32_t)(sweet_cpu_max_freq > 0 ? sweet_cpu_max_freq : 2803200);
++			int rc = sweet_cpufreq_apply_cap_locked(cap, true);
++			os_atomic_store(&cpufreq_at_target, 1, relaxed);
++			lck_mtx_unlock(&sweet_cpufreq_lock);
++			if (rc != 0) {
++				return ENXIO;
++			}
+ 		}
+ 	}
+ 	return error;
+ }
+ 
++static int
++sysctl_sweet_cpu_max_freq SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int val = sweet_cpu_max_freq;
++	int error = sysctl_handle_int(oidp, &val, 0, req);
++	if (error == 0 && req->newptr != USER_ADDR_NULL) {
++		if (val < 300000) {
++			val = 300000;
++		} else if (val > 2803200) {
++			val = 2803200;
++		}
++		sweet_cpu_max_freq = val;
++		if (sweet_cpufreq_enabled()) {
++			lck_mtx_lock(&sweet_cpufreq_lock);
++			if (os_atomic_load(&cpufreq_panel_awake, relaxed)) {
++				(void)sweet_cpufreq_apply_cap_locked((uint32_t)val, false);
++				os_atomic_store(&cpufreq_at_target, 1, relaxed);
++			} else {
++				os_atomic_store(&cpufreq_at_target, 0, relaxed);
++			}
++			lck_mtx_unlock(&sweet_cpufreq_lock);
++		}
++	}
++	return error;
++}
++
++static int
++sysctl_sweet_tsens SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int mc = sweet_tsens_max_mc();
++	if (mc < 0) {
++		return ENXIO;
++	}
++	return SYSCTL_OUT(req, &mc, sizeof(mc));
++}
++
++static int
++sysctl_sweet_tsens_sensors SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[256];
++	size_t off = 0;
++	int max_mc = -100000;
++
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	if (sweet_tsens_map_locked()) {
++		for (uint32_t i = 0; i < TSENS_MAX_SENSORS; i++) {
++			int mc = 0;
++			if (sweet_tsens_read_sensor_mc(tsens_tm_base, i, &mc) == 0) {
++				if (mc > max_mc) {
++					max_mc = mc;
++				}
++				int n = snprintf(buf + off, sizeof(buf) - off, "%ss%u=%d.%dC",
++				    off != 0 ? " " : "", i, mc / 1000, (mc < 0 ? -mc : mc) % 1000 / 100);
++				if (n > 0 && (size_t)n < sizeof(buf) - off) {
++					off += (size_t)n;
++				}
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++	if (off == 0) {
++		return ENXIO;
++	}
++	return SYSCTL_OUT(req, buf, off + 1);
++}
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: re-apply max)");
++    0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: max/eco/balance/kHz)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpu_max_freq, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cpu_max_freq, "I", "maximum CPU frequency cap in kHz across Gold & Silver OSM domains");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_max_freq, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_gpu_max_freq, 0, "maximum Adreno 610 GPU frequency cap in Hz");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_boost_enabled, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_touch_boost_enabled, 0, "enable CPU OPP boost on touch-down");
++SYSCTL_INT(_kern, OID_AUTO, sweet_launch_boost_enabled, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_launch_boost_enabled, 0, "enable CPU OPP boost on app launch");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_tsens, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_tsens, "I", "Qualcomm TSENS0 max silicon die temperature in millicelsius");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_tsens_sensors, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_tsens_sensors, "A", "Qualcomm TSENS0 per-sensor silicon temperatures");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_zone0, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_zone0, 0, "thermald Zone 0 (SoC) temperature in millicelsius");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_zone1, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_zone1, 0, "thermald Zone 1 (GPU) temperature in millicelsius");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_zone2, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_zone2, 0, "thermald Zone 2 (Battery) temperature in millicelsius");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_zone3, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_zone3, 0, "thermald Zone 3 (Skin) temperature in millicelsius");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_state, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_state, 0, "thermald active thermal state (0=Normal..3=Critical)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_thermal_policy, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_thermal_policy, 0, "thermald active mitigation policy bitmask");
++SYSCTL_INT(_kern, OID_AUTO, sweet_deep_sleep, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_deep_sleep, 0, "thermald AMOLED panel-off deep sleep state");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 8eb9701..b584236 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -697,10 +697,15 @@ touch_feel_add(bool is_down, bool is_up, unsigned finger, uint64_t now)
+ 	}
+ }
+ 
++extern void sweet_cpufreq_touch_boost(void);
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+ 	uint64_t now = mach_absolute_time();
++	if ((mask & ~st.active) != 0) {
++		sweet_cpufreq_touch_boost();
++	}
+ 	touch_fod(mask, x, y);
+ 	touch_tap_wake_check(mask, x, y);
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+@@ -787,9 +792,29 @@ touch_focaltech(void)
+ 	uint8_t buf[63];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
+-	if (err) {
+-		return err;
++	int err;
++	/*
++	 * Fast 21-byte I2C read (3-byte header + 3 contact slots = 0.51 ms vs 1.50 ms at 400 kHz)
++	 * whenever <= 2 fingers were active; if TD_STATUS reports 3..10 contacts, read the rest.
++	 */
++	if ((st.active & ~3u) == 0) {
++		err = touch_read(0x38, 0, false, buf, 21);
++		if (err) {
++			return err;
++		}
++		memset(buf + 21, 0xff, sizeof(buf) - 21);
++		unsigned n_hdr = buf[2] & 15u;
++		if (n_hdr > 2u && n_hdr <= TOUCH_MAX) {
++			err = touch_read(0x38, 21, false, buf + 21, sizeof(buf) - 21);
++			if (err) {
++				return err;
++			}
++		}
++	} else {
++		err = touch_read(0x38, 0, false, buf, sizeof(buf));
++		if (err) {
++			return err;
++		}
+ 	}
+ 	/* 0312: how often the IC really has a new frame while a contact is down (kern.sweet_touch_rate) */
+ 	{
+@@ -1187,6 +1212,7 @@ sweet_touch_init(void)
+ 	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	(void)PE_parse_boot_argn("sweettouchfast", &touch_fast, sizeof(touch_fast));
++	(void)PE_parse_boot_argn("sweettouch_short", &touch_short_read, sizeof(touch_short_read));
+ 	(void)PE_parse_boot_argn("sweettouchdiag", &st.diag, sizeof(st.diag));
+ 	/* topaz defaults; sapphire's FT3519T is set from its boot image */
+ 	st.fbits = 2;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0ae4041..ae5a1cb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -79,7 +79,7 @@ extern void sweet_usb_probe(void);
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+-#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++#define CMD_SLEEP_NS    (100ull * NSEC_PER_USEC)
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+@@ -758,11 +758,11 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
++	uint32_t cache = 1, wait = 1;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+-	su.cache = (cache == 1);
+-	su.wait = (wait == 1);
++	su.cache = (cache != 0);
++	su.wait = (wait != 0);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,

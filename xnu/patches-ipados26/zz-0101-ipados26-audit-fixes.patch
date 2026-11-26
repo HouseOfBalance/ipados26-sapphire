@@ -1,0 +1,846 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-26-0101: XNU 26.1 kernel audit fixes (early FB PA, TBI/LDAPRS* emulation, GPU timer/16K align, scale2 CPU fallback, MDP/cam/BT/FAT fixes)
+
+---
+diff --git a/bsd/dev/sweet_bt.c b/bsd/dev/sweet_bt.c
+index e2aec2f..c91119c 100755
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -903,11 +903,11 @@ static int
+ qcabt_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+ {
+ 	bt_rx_run = false;
+-	for (int i = 0; i < 200 && bt_rx_alive; i++) {
++	while (bt_rx_alive) {
+ 		IOSleep(1);
+ 	}
+-	bt_open_flag = false;
+ 	lck_mtx_lock(&sweet_bt_mtx);
++	bt_open_flag = false;
+ 	btlog("/dev/qcabt closed: rx overrun %u, parity/framing %u, break %u, ring drops %u", bt_ovr, bt_par, bt_brk, bt_rdrops);
+ 	lck_mtx_unlock(&sweet_bt_mtx);
+ 	return 0;
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 2744a25..5e02e32 100755
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -961,6 +961,7 @@ cam_stream_onoff(bool on)
+ }
+ 
+ static int hm6_switch(unsigned mode);
++static void pv_stop(void);
+ 
+ static int
+ cam_sensor_on(void)
+@@ -1332,6 +1333,7 @@ cam_capture(void)
+ static int
+ cam_stop(void)
+ {
++	pv_stop();
+ 	if (cam_csid != 0 && cam_csid_up) {
+ 		wr(cam_csid, 0x308, 0);
+ 		wr(cam_csid, 0x2300, 0);
+@@ -1352,6 +1354,7 @@ cam_stop(void)
+ static int
+ cam_pool_test(void)
+ {
++	pv_stop();
+ 	if (!cam_pool_map()) {
+ 		return ENOMEM;
+ 	}
+@@ -1594,6 +1597,7 @@ cam_tfe_read(void)
+ static int
+ cam_wm_config(void)
+ {
++	pv_stop();
+ 	uint32_t bytes = cs.w * cs.h * 10 / 8;
+ 	if (!cam_csid_up || !s_ready) {
+ 		camlog("op 22: needs op 11 and op 20 first");
+@@ -1988,14 +1992,14 @@ pv_stop(void)
+ 		return;
+ 	}
+ 	pv_run = false;
+-	for (int i = 0; i < 200 && pv_alive; i++) {
+-		IOSleep(1);
+-	}
+-	if (cam_csid != 0) {
++	if (cam_csid != 0 && cam_csid_up) {
+ 		wr(cam_csid, 0x308, 0);                         /* RDI0 halt at the frame boundary */
+ 		wr(cam_csid, 0x2300, 0);
+ 		wr(cam_csid, 0x102C, 0x2);
+ 	}
++	while (pv_alive) {
++		IOSleep(1);
++	}
+ 	camlog("preview stopped after %llu frames (overflows %llu, SMMU fault %#x)", pv_seq, pv_ovf, pv_fault);
+ }
+ 
+@@ -2101,10 +2105,29 @@ pv_start(void)
+ 	cam_sel = -1;
+ 	cam_frame_off = 0;
+ 	cam_frame_len = 0;
+-	IOSleep(300);
+-	camlog("op 30: preview mode %u (%ux%u, %u bytes a frame): %llu frames in 300 ms, latest buffer %d", mode, cs.w, cs.h,
+-	    pv_bytes, pv_seq, pv_latest);
+-	return pv_seq != 0 ? 0 : EIO;
++	uint64_t wait_ms = 300;
++	if (slot == 0 && cam_frame_ns / 1000000ull * 2 + 100 > wait_ms) {
++		wait_ms = cam_frame_ns / 1000000ull * 2 + 100;
++		if (wait_ms > 3000) {
++			wait_ms = 3000;
++		}
++	}
++	uint64_t waited = 0;
++	while (waited < wait_ms && pv_seq == 0) {
++		IOSleep(10);
++		waited += 10;
++	}
++	if (waited < 300 && pv_seq != 0) {
++		IOSleep(50);
++		waited += 50;
++	}
++	camlog("op 30: preview mode %u (%ux%u, %u bytes a frame): %llu frames in %llu ms, latest buffer %d", mode, cs.w, cs.h,
++	    pv_bytes, pv_seq, waited, pv_latest);
++	if (pv_seq == 0) {
++		pv_stop();
++		return EIO;
++	}
++	return 0;
+ }
+ 
+ /* op 32 */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 82fa076..0bbbe4b 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -210,7 +210,6 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ /* 0319: which Metal plug-in the accelerator names (SweetFramebuffer.cpp sweet_metal_plugin): 1 SapphireMetal, 2 HakiosMetal */
+ extern int sweet_metal_plugin(int set);
+@@ -232,3 +231,4 @@ sysctl_sweet_metal SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_metal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_metal, "I", "sapphire: the Metal plug-in the accelerator names: 0 none, 1 SapphireMetal, 2 HakiosMetal");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c454116..0ae4041 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1071,7 +1071,6 @@ sweet_ufs_rootdev(dev_t *dev)
+ 	*dev = su.bdev;
+ 	return 0;
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ /*
+  * sapphire 0305: the phone handed back to Android. The A/B slot that is booted is kept in the GPT of the
+@@ -1512,3 +1511,4 @@ sysctl_sweet_inbox SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_inbox, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_inbox, "S", "sapphire: the inbox after the root volume (new: u64 offset; old: up to 1 MiB)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f4f919c..35be399 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1027,15 +1027,22 @@ static int
+ sysctl_sweet_usb_trace SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	static char out[UT_N * 40];
++	const vm_size_t out_sz = UT_N * 40;
++	char *out = (char *)kalloc_data(out_sz, Z_WAITOK);
++	if (out == NULL) {
++		return ENOMEM;
++	}
+ 	size_t n = 0;
+-	uint32_t start = ut_pos > UT_N ? ut_pos - UT_N : 0;
+-	for (uint32_t i = start; i < ut_pos && n + 48 < sizeof(out); i++) {
+-		struct ut_ent *e = &ut_ring[i % UT_N];
+-		n += (size_t)snprintf(out + n, sizeof(out) - n, "%u %s %08x %08x\n", e->ms, e->what, e->a, e->b);
++	uint32_t end = __atomic_load_n(&ut_pos, __ATOMIC_ACQUIRE);
++	uint32_t start = end > UT_N ? end - UT_N : 0;
++	for (uint32_t i = start; i < end && n + 48 < out_sz; i++) {
++		struct ut_ent e = ut_ring[i % UT_N];
++		n += (size_t)snprintf(out + n, out_sz - n, "%u %s %08x %08x\n", e.ms, e.what, e.a, e.b);
+ 	}
+ 	out[n] = 0;
+-	return SYSCTL_OUT(req, out, n + 1);
++	int err = SYSCTL_OUT(req, out, n + 1);
++	kfree_data(out, out_sz);
++	return err;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_usb_trace, "A", "USB gadget trace: ms what a b");
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 7762160..e89717f 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -2946,9 +2946,9 @@ SapphireGpuClient::create(uint64_t size, uint64_t fixed, uint64_t *out)
+ 	if (size == 0 || size > (UVA_END - UVA_BASE)) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	size = (size + 4095) & ~4095ull;
++	size = (size + 16383ull) & ~16383ull;
+ 	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 4096);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 16384);
+ 	if (m == NULL) {
+ 		return kIOReturnNoMemory;
+ 	}
+@@ -3299,6 +3299,7 @@ msm_gpu_idle(void)
+ #define GPOOL_PA            0x100000000ull
+ #define GPOOL_SIZE          0x40000000ull
+ #define GPOOL_PAGES         (GPOOL_SIZE >> 12)
++#define MSM_UPAGE           16384ull            /* 64-bit iOS user tasks always map 16 KiB pages */
+ static uint64_t gpool_bits[GPOOL_PAGES / 64];
+ static uint64_t gpool_next;
+ static int gpool_on = -1;
+@@ -3332,17 +3333,26 @@ bits_mark(uint64_t *bits, uint64_t p0, uint64_t n, bool used)
+ static uint64_t
+ gpool_alloc(uint64_t n)
+ {
++	n = (n + 3ull) & ~3ull;                     /* 16 KiB granularity so user mappings never expose adjacent BOs */
+ 	for (int pass = 0; pass < 2; pass++) {
+-		uint64_t start = pass == 0 ? gpool_next : 0, end = pass == 0 ? GPOOL_PAGES : gpool_next, run = 0;
++		uint64_t start = pass == 0 ? ((gpool_next + 3ull) & ~3ull) : 0;
++		uint64_t end = pass == 0 ? GPOOL_PAGES : ((gpool_next + 3ull) & ~3ull), run = 0;
++		if (end > GPOOL_PAGES) {
++			end = GPOOL_PAGES;
++		}
+ 		for (uint64_t p = start; p < end; p++) {
+ 			if ((p & 63) == 0 && run == 0 && gpool_bits[p >> 6] == ~0ull) {
+ 				p += 63;
+ 				continue;
+ 			}
+-			run = ((gpool_bits[p >> 6] >> (p & 63)) & 1) ? 0 : run + 1;
++			if (((gpool_bits[p >> 6] >> (p & 63)) & 1) || (run == 0 && (p & 3) != 0)) {
++				run = 0;
++			} else {
++				run++;
++			}
+ 			if (run == n) {
+ 				bits_mark(gpool_bits, p + 1 - n, n, true);
+-				gpool_next = p + 1;
++				gpool_next = (p + 1 + 3ull) & ~3ull;
+ 				return GPOOL_PA + ((p + 1 - n) << 12);
+ 			}
+ 		}
+@@ -3377,13 +3387,7 @@ msm_wait(uint32_t f, uint64_t ms)
+ 			}
+ 			return false;
+ 		}
+-		/* 0359: RBBM_INT_0_STATUS CACHE_FLUSH_TS wakeup + 100 us fast-path poll before sleeping */
+-		if ((grd(REG_RBBM_INT_0_STATUS) & (1u << 20)) != 0) {
+-			gwr(REG_RBBM_INT_CLEAR_CMD, 1u << 20);
+-			if (msm_fence_done(f)) {
+-				return true;
+-			}
+-		}
++		/* 0359/0364: 100 us DDR fence fast-path poll without unlocked RBBM MMIO touches */
+ 		if (polls < 20u) {
+ 			IODelay(5);
+ 			polls++;
+@@ -3537,9 +3541,11 @@ public:
+ 
+ 	static void reap_timer_trampoline(thread_call_param_t p0, thread_call_param_t p1);
+ 	void reapTimer(void);
++	void stopReapTimer(void);
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
+ 	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+@@ -3719,19 +3725,42 @@ SapphireGPUClient::reap(void)
+ void
+ SapphireGPUClient::reapTimer(void)
+ {
+-	fReapTimerFirings++;
+ 	OSIncrementAtomic((volatile SInt32 *)&g_reap_timer_firings);
+ 	if (service_lock != NULL) {
+ 		IOLockLock(service_lock);
+-		if (fReapTimerArmed && fLeft != NULL) {
+-			reap();
++		if (fReapTimerArmed) {
++			fReapTimerFirings++;
++			if (fLeft != NULL) {
++				reap();
++			}
++			if (fReapTimer != NULL) {
++				uint64_t dl = 0;
++				clock_interval_to_deadline(10, kMillisecondScale, &dl);
++				thread_call_enter_delayed(fReapTimer, dl);
++			}
+ 		}
+ 		IOLockUnlock(service_lock);
+ 	}
+-	if (fReapTimerArmed && fReapTimer != NULL) {
+-		uint64_t dl = 0;
+-		clock_interval_to_deadline(10, kMillisecondScale, &dl);
+-		thread_call_enter_delayed(fReapTimer, dl);
++}
++
++void
++SapphireGPUClient::stopReapTimer(void)
++{
++	thread_call_t t = NULL;
++	if (service_lock != NULL) {
++		IOLockLock(service_lock);
++		fReapTimerArmed = false;
++		t = fReapTimer;
++		fReapTimer = NULL;
++		IOLockUnlock(service_lock);
++	} else {
++		fReapTimerArmed = false;
++		t = fReapTimer;
++		fReapTimer = NULL;
++	}
++	if (t != NULL) {
++		(void)thread_call_cancel_wait(t);
++		thread_call_free(t);
+ 	}
+ }
+ 
+@@ -3799,15 +3828,25 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ 	freeBo(b);
+ }
+ 
++void
++SapphireGPUClient::free(void)
++{
++	stopReapTimer();
++	if (fBo != NULL) {
++		IODelete(fBo, struct msm_bo, MSM_BUFFERS);
++		fBo = NULL;
++	}
++	if (fLeft != NULL) {
++		IODelete(fLeft, struct msm_bo, MSM_LEFT);
++		fLeft = NULL;
++	}
++	IOUserClient::free();
++}
++
+ IOReturn
+ SapphireGPUClient::clientClose(void)
+ {
+-	fReapTimerArmed = false;
+-	if (fReapTimer != NULL) {
+-		thread_call_cancel(fReapTimer);
+-		thread_call_free(fReapTimer);
+-		fReapTimer = NULL;
+-	}
++	stopReapTimer();
+ 	if (service_ready && !msm_wait(msm_seq, 2000)) {       /* nothing of ours may still be at work */
+ 		msm_hung(fName, msm_seq, false);
+ 	}
+@@ -3860,7 +3899,7 @@ SapphireGPUClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ IOReturn
+ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ {
+-	uint64_t size = (r->size + 4095) & ~4095ull;
++	uint64_t size = (r->size + (MSM_UPAGE - 1)) & ~(MSM_UPAGE - 1);
+ 	uint32_t h;
+ 
+ 	if (size == 0 || size > MSM_BUFFER_MAX) {
+@@ -3953,7 +3992,7 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 4096);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, MSM_UPAGE);
+ 	if (m == NULL) {
+ 		LOG("msm: %s: no memory for %llu KB (%u buffers, %llu MB)", fName, size >> 10, fCount, fBytes >> 20);
+ 		return kIOReturnNoMemory;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eb9253a..caba3e8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -821,9 +821,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			} else if (step < 32) {
+ 				first = true;
+ 				fb->fFadeStep = step < 30 ? 30 : step + 1;
++			} else if (sweet_panel_sleep >= 2 && fb->fCtl0 != NULL && !sweet_mdp_unstaged) {
++				sweet_ctl0_saved = fb->fCtl0[0];
++				fb->fCtl0[0] = 0;
++				__asm__ volatile("dsb sy" ::: "memory");
++				fb->fCtl0[0x18 / 4] = 0x20041;  /* flush VIG0 + LM0 + CTL */
++				__asm__ volatile("dsb sy" ::: "memory");
++				sweet_mdp_unstaged = true;
+ 			}
++			bool sleep_idle = !first && sweet_panel_sleep >= 1;
+ 			IOLockUnlock(fb->fLock);
+-			if (first && fb->fPixels != 0) {
++			if (first && fb->fPixels != 0 && sweet_fb_panel_off) {
+ 				if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+ 					fb->scanFrom(fb->fBootSrc, fb->fBootStride);
+ 				}
+@@ -835,15 +843,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 				__asm__ volatile("dsb sy" ::: "memory");
+ 			}
+-			if (!first && sweet_panel_sleep >= 2 && fb->fCtl0 != NULL && !sweet_mdp_unstaged) {
+-				sweet_ctl0_saved = fb->fCtl0[0];
+-				fb->fCtl0[0] = 0;
+-				__asm__ volatile("dsb sy" ::: "memory");
+-				fb->fCtl0[0x18 / 4] = 0x20041;  /* flush VIG0 + LM0 + CTL */
+-				__asm__ volatile("dsb sy" ::: "memory");
+-				sweet_mdp_unstaged = true;
+-			}
+-			if (!first && sweet_panel_sleep >= 1) {
++			if (sleep_idle) {
+ 				sender->setTimeoutUS(50000);    /* 20 Hz idle check while panel off (50 ms max wake latency) */
+ 			} else {
+ 				fb->armVsync(sender);
+@@ -1674,6 +1674,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	bool gpu_avail = sweet_fb_gpucopy_on() && sapphire_gpu_ready();
+ 	bool gpu_frame = nlayers == 1 && gpu_avail;
+ 	bool gpu_used = false;
++	bool cpu_drawn = false;
+ 
+ 	/*
+ 	 * 0235/0356: always wait for the previous GPU copy before submitting a new one
+@@ -1729,13 +1730,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (fScale2) {
+ 			/*
+-			 * 0239: a 2x frame (one full-screen layer, as CoreAnimation sends them) goes onto the
+-			 * panel scaled by the GPU: the panel's window of the 3x picture, at 2/3 of its place
+-			 * and size. Anything else is not shown (the CPU copies 1:1 and would put it small).
++			 * 0239/0364: a single-layer 2x frame goes onto the panel scaled by the GPU; when GPU blit
++			 * is unavailable (CPU-only / early boot) or multiple layers are active, fall back to a CPU
++			 * scaler into dst so frames and secondary overlays are never dropped to black.
+ 			 */
+ 			static uint32_t scale_told;
+ 			bool shown = false;
+-			if (!gpu_used && gpu_avail && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
++			if (!gpu_used && nlayers == 1 && gpu_avail && bpe == 4 && src != 0 &&
++			    s->width >= fLogicalW && s->height >= fLogicalH &&
+ 			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
+ 				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[dstIdx] : fPhys;
+ 				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+@@ -1769,9 +1771,60 @@ AppleCLCD::present(const uint8_t *rec)
+ 					gpu_used = true;
+ 				}
+ 			}
+-			if (!shown && scale_told++ < 8) {
+-				IOLog("SWEET FB: 2x frame skipped (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_avail,
+-				    s->width, s->height, bpe);
++			if (shown) {
++				s->release();
++				continue;
++			}
++			if (scale_told++ < 8) {
++				IOLog("SWEET FB: 2x frame CPU scale fallback (layers %u, gpu %d, surface %ux%u bpe %u)\n",
++				    nlayers, gpu_avail, s->width, s->height, bpe);
++			}
++			if (src != 0 && bpe == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
++			    s->memory != NULL && fLogicalW != 0 && fLogicalH != 0) {
++				for (unsigned i = 0; fFlipWait && i < 200 && sapphire_gpu_copy_pending(); i++) {
++					IODelay(100);
++				}
++				int32_t lw = w > 0 ? w : (int32_t)fLogicalW;
++				int32_t lh = h > 0 ? h : (int32_t)fLogicalH;
++				int32_t lsx = sx < 0 ? 0 : sx, lsy = sy < 0 ? 0 : sy;
++				int32_t ldx = dx < 0 ? 0 : dx, ldy = dy < 0 ? 0 : dy;
++				int rs = (layer == 0 && sweet_fb_rscale >= 400 && sweet_fb_rscale <= 1000) ? sweet_fb_rscale : 1000;
++				uint64_t mem_len = s->memory->getLength();
++				for (uint32_t py = 0; py < fHeight; py++) {
++					int32_t ly = (int32_t)(((int64_t)((int32_t)py + fOffY) * (int64_t)fLogicalH) / SWEET_FB_LOGICAL_H);
++					if (ly < ldy || ly >= ldy + lh) {
++						continue;
++					}
++					int32_t uy = (int32_t)(((int64_t)(lsy + ly - ldy) * rs) / 1000);
++					if (uy < 0 || (uint32_t)uy >= s->height) {
++						continue;
++					}
++					uint64_t row_off = s->offset + (uint64_t)(uint32_t)uy * s->bytesPerRow;
++					if (row_off + (uint64_t)s->width * 4 > mem_len) {
++						break;
++					}
++					const uint32_t *srow = (const uint32_t *)(src + row_off);
++					uint32_t *drow = (uint32_t *)(dst + (uint64_t)py * fRowBytes);
++					for (uint32_t px = 0; px < fWidth; px++) {
++						int32_t lx = (int32_t)(((int64_t)((int32_t)px + fOffX) * (int64_t)fLogicalW) / SWEET_FB_LOGICAL_W);
++						if (lx < ldx || lx >= ldx + lw) {
++							continue;
++						}
++						int32_t ux = (int32_t)(((int64_t)(lsx + lx - ldx) * rs) / 1000);
++						if (ux >= 0 && (uint32_t)ux < s->width) {
++							uint32_t p = srow[ux];
++							if (layer == 0 || (p >> 24) == 0xff) {
++								drow[px] = p;
++							} else if ((p >> 24) != 0) {
++								uint32_t a8 = p >> 24, ia = 255 - a8, bg = drow[px];
++								uint32_t rb = (p & 0x00ff00ffu) + (((bg & 0x00ff00ffu) * ia) >> 8);
++								uint32_t g = (p & 0x0000ff00u) + (((bg & 0x0000ff00u) * ia) >> 8);
++								drow[px] = 0xff000000u | (rb & 0x00ff00ffu) | (g & 0x0000ff00u);
++							}
++						}
++					}
++				}
++				cpu_drawn = true;
+ 			}
+ 			s->release();
+ 			continue;
+@@ -1856,6 +1909,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			cpu_drawn = true;
+ 		}
+ 		s->release();
+ 	}
+@@ -1874,8 +1928,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		return true;
+ 	}
+-	if (fScale2) {
+-		/* Never flip to an unwritten/stale back buffer in scale2 mode */
++	if (!cpu_drawn) {
++		/* Never flip to an unwritten/stale back buffer when no layer was drawn */
+ 		return false;
+ 	}
+ 	if (fFlip[0] != NULL) {
+@@ -2099,6 +2153,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 					 */
+ 					fFB->fDirty = false;
+ 					fFB->fWakeTicks = fFB->fRateHz * 2 + 1;   /* 0326: 2 s (0.3 s ran out before Metal backboardd sent its first frame after wake: the old frame flashed, then the lock screen) */
++					fFB->fNextVsync = 0;
++					if (fFB->fVsync != NULL) {
++						fFB->armVsync(fFB->fVsync);
++					}
+ 				}
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
+@@ -2374,7 +2432,6 @@ sweet_fb_dsi_seq(const uint8_t *seq, uint32_t len, const char *what, int quiet)
+ 	}
+ 	return failed;
+ }
+-#endif /* SWEET */
+ 
+ /*
+  * 0286: kern.sweet_fb_frame_await = N: frame N (the bridge's numbers, not 0) is being sent to the
+@@ -2482,3 +2539,4 @@ sweet_fb_frame_stats SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_frame_stats, "A", "0286: swaps held until their frame was sent");
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index 8c75eda..f933b4e 100755
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -2624,6 +2624,11 @@ fp_bio_unlock(void)
+ static int
+ fp_face_unlock(void)
+ {
++	uint32_t epoch = sweet_aks_passcode_unlocks();
++	if (epoch != q_fod_epoch) {
++		q_fod_epoch = epoch;
++		q_fod_fails = 0;
++	}
+ 	if (q_fod_fails >= 5) {
+ 		LOGA("op 28: face unlock refused (locked out: %u failed attempts)", q_fod_fails);
+ 		return EPERM;
+@@ -2631,6 +2636,8 @@ fp_face_unlock(void)
+ 	q_match_fid = 0xFA0E2D01u;
+ 	q_match_abs = mach_absolute_time();
+ 	int r = sweet_aks_biometric_unlock();
++	q_match_abs = 0;
++	q_match_fid = 0;
+ 	if (r == 0) {
+ 		q_fod_fails = 0;
+ 	}
+@@ -2641,6 +2648,11 @@ fp_face_unlock(void)
+ static int
+ fp_face_fail(void)
+ {
++	uint32_t epoch = sweet_aks_passcode_unlocks();
++	if (epoch != q_fod_epoch) {
++		q_fod_epoch = epoch;
++		q_fod_fails = 0;
++	}
+ 	q_fod_fails++;
+ 	LOGA("op 29: face unlock fail (%u failed attempts)", q_fod_fails);
+ 	return q_fod_fails >= 5 ? EPERM : 0;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 05e5e57..51d612a 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4043,29 +4043,47 @@ fw_fat_build(void)
+ 	}
+ 	fat_root_bytes = rootent * 32;
+ 	uint32_t root_secs = (fat_root_bytes + fat_bps - 1) / fat_bps;
+-	uint32_t data_sec = rsvd + nfats * fatsz + root_secs;
++	uint64_t data_sec64 = (uint64_t)rsvd + (uint64_t)nfats * fatsz + root_secs;
++	if ((uint64_t)total <= data_sec64) {
++		return false;
++	}
++	uint32_t data_sec = (uint32_t)data_sec64;
+ 	fat_nclus = (total - data_sec) / spc;
+ 	fat_bits = fat_nclus < 4085 ? 12 : fat_nclus < 65525 ? 16 : 32;
+ 	if (fat_bits == 12) {
+ 		return false;
+ 	}
++	uint64_t fat_bytes64 = (uint64_t)fatsz * fat_bps;
++	uint64_t min_fat_bytes = ((uint64_t)fat_nclus + 2ull) * (fat_bits == 32 ? 4ull : 2ull);
++	if (fat_bytes64 < min_fat_bytes || fat_bytes64 > 64ull * 1024 * 1024) {
++		return false;
++	}
+ 	fat_clus_bytes = spc * fat_bps;
+ 	fat_root_off = (uint64_t)(rsvd + nfats * fatsz) * fat_bps;
+ 	fat_data_off = (uint64_t)data_sec * fat_bps;
+ 	fat_root_clus = fat_bits == 32 ? fat_le(bs + 44, 4) : 0;
+-	uint32_t fat_bytes = fatsz * fat_bps;
++	uint32_t fat_bytes = (uint32_t)fat_bytes64;
++	fat_nfiles = 0;
++	fat_next = 0;
+ 	fat_tab = (uint8_t *)IOMalloc(fat_bytes);
+ 	fat_ext = (struct fw_extent *)IOMalloc(sizeof(*fat_ext) * FW_FAT_MAX_EXT);
+ 	fat_all = (struct fw_all_file *)IOMalloc(sizeof(*fat_all) * FW_FAT_MAX_FILES);
+ 	if (fat_tab == NULL || fat_ext == NULL || fat_all == NULL ||
+ 	    sweet_ufs_read_part(fw_part, (uint64_t)rsvd * fat_bps, fat_tab, fat_bytes) != 0) {
+ 		LOG("firmware: FAT: no memory or the FAT is not readable");
++		if (fat_tab != NULL) { IOFree(fat_tab, fat_bytes); fat_tab = NULL; }
++		if (fat_ext != NULL) { IOFree(fat_ext, sizeof(*fat_ext) * FW_FAT_MAX_EXT); fat_ext = NULL; }
++		if (fat_all != NULL) { IOFree(fat_all, sizeof(*fat_all) * FW_FAT_MAX_FILES); fat_all = NULL; }
+ 		return false;
+ 	}
+ 	fat_walk(fat_root_clus, "", 0);
+ 	IOFree(fat_tab, fat_bytes);
+ 	fat_tab = NULL;
+ 	if (fat_nfiles == 0) {
++		IOFree(fat_ext, sizeof(*fat_ext) * FW_FAT_MAX_EXT);
++		fat_ext = NULL;
++		IOFree(fat_all, sizeof(*fat_all) * FW_FAT_MAX_FILES);
++		fat_all = NULL;
+ 		return false;
+ 	}
+ 	fw_ext_tab[FW_FAT] = fat_ext;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 68a7bc5..ed38b55 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1848,7 +1848,7 @@ sweet_early_map_final(void)
+ 		}
+ 	}
+ 	for (unsigned int i = 0; i < 6; i++) {
+-		l2[first + i] = (0x9c000000ULL + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		l2[first + i] = (0x5c000000ULL + i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+@@ -1876,7 +1876,7 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0x5c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 65d4fe0..45c7afb 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1308,7 +1308,8 @@ sweet_emulate_armv83_pac(arm_saved_state_t *state, uint32_t instr)
+ 		uint32_t w = (instr >> 11) & 1;
+ 		uint32_t rn = (instr >> 5) & 31, rt = instr & 31;
+ 		int64_t byte_off = (int64_t)(s ? (imm9 - 512) : imm9) * 8;
+-		uint64_t base = (rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn)) & 0x0000FFFFFFFFFFFFULL;
++		uint64_t raw_rn = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++		uint64_t base = raw_rn & 0x0000FFFFFFFFFFFFULL;
+ 		user_addr_t addr = (user_addr_t)(base + byte_off);
+ 		uint64_t loaded = 0;
+ 		if (addr >= MACH_VM_MAX_ADDRESS || copyin(addr, &loaded, sizeof(loaded)) != 0) {
+@@ -1318,7 +1319,7 @@ sweet_emulate_armv83_pac(arm_saved_state_t *state, uint32_t instr)
+ 			if (rn == 31) {
+ 				set_saved_state_sp(state, addr);
+ 			} else {
+-				set_saved_state_reg(state, rn, (register_t)addr);
++				set_saved_state_reg(state, rn, (register_t)((raw_rn & 0xFF00000000000000ULL) | (addr & 0x00FFFFFFFFFFFFFFULL)));
+ 			}
+ 		}
+ 		if (rt != 31) {
+@@ -1337,7 +1338,7 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 	uint32_t rs = (instr >> 16) & 31, rn = (instr >> 5) & 31, rt = instr & 31;
+ 	uint64_t mask = size == 3 ? ~0ULL : (1ULL << (8 << size)) - 1;
+ 	uint64_t operand = 0, compare = 0, old = 0;
+-	uint32_t op, dst;
++	uint32_t op, dst, sext = 0;
+ 	int err;
+ 
+ 	if ((instr & 0x3F200C00) == 0x38200000) {
+@@ -1348,6 +1349,12 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 			op = 8;         /* SWP */
+ 		} else if (opc == 4 && rs == 31) {
+ 			op = 10;        /* LDAPR */
++		} else if (opc == 6 && rs == 31 && size <= 2) {
++			op = 10;        /* LDAPRSB / LDAPRSH / LDAPRSW (64-bit Xt) */
++			sext = 64;
++		} else if (opc == 7 && rs == 31 && size <= 1) {
++			op = 10;        /* LDAPRSB / LDAPRSH (32-bit Wt) */
++			sext = 32;
+ 		} else {
+ 			return false;
+ 		}
+@@ -1398,7 +1405,7 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 		return false;
+ 	}
+ 
+-	user_addr_t addr = rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn);
++	user_addr_t addr = (rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn)) & 0x0000FFFFFFFFFFFFULL;
+ 	if ((addr & ((1ULL << size) - 1)) != 0 || addr >= MACH_VM_MAX_ADDRESS) {
+ 		return false;
+ 	}
+@@ -1412,6 +1419,13 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 		return false;
+ 	}
+ 	if (dst != 31) {
++		if (sext == 64) {
++			unsigned int sh = 64 - (8u << size);
++			old = (uint64_t)((int64_t)(old << sh) >> sh);
++		} else if (sext == 32) {
++			unsigned int sh = 32 - (8u << size);
++			old = (uint64_t)(uint32_t)((int32_t)((uint32_t)old << sh) >> sh);
++		}
+ 		set_saved_state_reg(state, dst, (register_t)old);
+ 	}
+ 	add_saved_state_pc(state, 4);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 936aadd..e77609c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -526,11 +526,7 @@
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-#if defined(TOPAZ_4K)
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)	/* sapphire splash framebuffer */
+-#else
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
+-#endif
++	MOV64	x0, (0x5c000000 + 2368 * 4320)	/* sapphire splash framebuffer */
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -695,12 +691,12 @@
+ 
+ #if defined(SWEET) && defined(TOPAZ_4K)
+ 	/*
+-	 * sapphire splash framebuffer (0x9c000000, 1080x2400x4 = 10 MB) VA=PA as
+-	 * Normal-NC: six 2 MB blocks in an L2 table of its own (L1 index 2;
+-	 * RAM is above 4 GB), for the early screen console.
++	 * sapphire splash framebuffer (0x5c000000, 1080x2400x4 = 10 MB) VA=PA as
++	 * Normal-NC: six 2 MB blocks in an L2 table of its own (L1 index 1;
++	 * RAM is at 0x80000000 / above 4 GB), for the early screen console.
+ 	 */
+ 	add		x2, x2, PGBYTES
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0x5c000000
+ 	create_l1_table_entry x10, x1, x2, x11, x12, x13
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+@@ -723,7 +719,7 @@ Ltopaz_fb_block:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0x5c000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index cbecd03..572c4b9 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,7 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-#if defined(TOPAZ_4K)
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;  /* sapphire splash */
+-#else
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+-#endif
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x5c000000;  /* sapphire splash */
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index e22d590..5fde151 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3467,7 +3467,8 @@ static const int8_t sweet_sin[256] = {0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,4
+ static uint64_t
+ sweet_spl2_size(const struct sweet_spl2 *h)
+ {
+-	return sizeof(*h) + (uint64_t)h->w * h->h * 4 + (uint64_t)h->gw * h->gh * 4 + (uint64_t)h->ww * h->wh +
++	return sizeof(*h) + (uint64_t)h->w * h->h * 4 + (uint64_t)h->gw * h->gh * 4 +
++	       (((uint64_t)h->ww * h->wh + 3ull) & ~3ull) +
+ 	       (uint64_t)h->n * 4 + (uint64_t)h->spr * h->spr * 4 + (uint64_t)h->glint_n * 4;
+ }
+ 
+@@ -3608,12 +3609,13 @@ sweet_splash_first(void)
+ 	if (sweet_splash_pa == 0 || vinfo.v_baseaddr == 0 || vinfo.v_depth != 32 || sweet_splash_pic != NULL) {
+ 		return;
+ 	}
+-	vm_offset_t m = ml_io_map_unmappable((vm_map_offset_t)(sweet_splash_pa & ~(uint64_t)PAGE_MASK),
+-	    round_page(16 + (vm_size_t)vinfo.v_width * vinfo.v_height * 4 + PAGE_SIZE), VM_WIMG_WCOMB);
++	vm_map_offset_t pa_page = (vm_map_offset_t)(sweet_splash_pa & ~(uint64_t)PAGE_MASK);
++	vm_size_t page_off = (vm_size_t)(sweet_splash_pa & PAGE_MASK);
++	vm_offset_t m = ml_io_map_unmappable(pa_page, round_page(page_off + sizeof(struct sweet_spl2)), VM_WIMG_WCOMB);
+ 	if (m == 0) {
+ 		return;
+ 	}
+-	const uint32_t *hdr = (const uint32_t *)(m + (sweet_splash_pa & PAGE_MASK));
++	const uint32_t *hdr = (const uint32_t *)(m + page_off);
+ 	if (hdr[0] == 0x324c5053u) {    /* "SPL2" (0309): the whole blob mapped, its parts found */
+ 		const struct sweet_spl2 *h2 = (const struct sweet_spl2 *)hdr;
+ 		if (h2->w != vinfo.v_width || h2->h != vinfo.v_height || h2->n == 0 || h2->gw == 0 ||
+@@ -3621,19 +3623,19 @@ sweet_splash_first(void)
+ 		    h2->wy + h2->wh > h2->h || h2->spr > 512 || h2->glint_n > 64) {
+ 			return;
+ 		}
+-		vm_offset_t m2 = ml_io_map_unmappable((vm_map_offset_t)(sweet_splash_pa & ~(uint64_t)PAGE_MASK),
+-		    round_page(sweet_spl2_size(h2) + PAGE_SIZE), VM_WIMG_WCOMB);
++		vm_offset_t m2 = ml_io_map_unmappable(pa_page,
++		    round_page(page_off + sweet_spl2_size(h2)), VM_WIMG_WCOMB);
+ 		if (m2 == 0) {
+ 			return;
+ 		}
+-		h2 = (const struct sweet_spl2 *)(m2 + (sweet_splash_pa & PAGE_MASK));
++		h2 = (const struct sweet_spl2 *)(m2 + page_off);
+ 		const uint8_t *d = (const uint8_t *)(h2 + 1);
+ 		spl2_base = (const uint32_t *)d;
+ 		d += (size_t)h2->w * h2->h * 4;
+ 		spl2_glow = (const uint32_t *)d;
+ 		d += (size_t)h2->gw * h2->gh * 4;
+ 		spl2_mask = d;
+-		d += (size_t)h2->ww * h2->wh;
++		d += ((size_t)h2->ww * h2->wh + 3u) & ~(size_t)3u;
+ 		spl2_ring = (const int16_t *)d;
+ 		d += (size_t)h2->n * 4;
+ 		spl2_spr = (const uint32_t *)d;
+@@ -3652,8 +3654,14 @@ sweet_splash_first(void)
+ 	    SPLASH_PIC_Y + hdr[2] > vinfo.v_height) {
+ 		return;
+ 	}
+-	sweet_splash_w = hdr[1];
+-	sweet_splash_h = hdr[2];
++	uint32_t sw = hdr[1], sh = hdr[2];
++	vm_offset_t m1 = ml_io_map_unmappable(pa_page, round_page(page_off + 16 + (vm_size_t)sw * sh * 4), VM_WIMG_WCOMB);
++	if (m1 == 0) {
++		return;
++	}
++	hdr = (const uint32_t *)(m1 + page_off);
++	sweet_splash_w = sw;
++	sweet_splash_h = sh;
+ 	sweet_splash_pic = hdr + 4;
+ 	sweet_splash_active = 1;
+ 	sweet_splash_base((uint32_t *)vinfo.v_baseaddr, vinfo.v_rowbytes, vinfo.v_width, vinfo.v_height);

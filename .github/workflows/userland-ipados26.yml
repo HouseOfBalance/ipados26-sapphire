@@ -1,0 +1,376 @@
+name: userland-ipados26
+
+on:
+  workflow_dispatch:
+    inputs:
+      xcode_version:
+        description: Optional Xcode version override (e.g. 26.1, 16.4, 16.3, 16.2; empty = deterministic auto-select)
+        required: false
+        default: ""
+  push:
+    branches: [ipados-26, main]
+    paths:
+      - "userland/**"
+      - "metal/**"
+      - "hakios-metal/**"
+      - "devices/sapphire/**"
+      - "tools/ipados26_depac.py"
+      - "tools/ipados26_ca_metallib.py"
+      - "tools/ipados26-root-tweaks.py"
+      - "tests/run_unit_tests.py"
+      - ".github/workflows/userland-ipados26.yml"
+
+concurrency:
+  group: userland26-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE_VERSION: ${{ inputs.xcode_version || '' }}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run automated unit tests
+        run: python3 -B tests/run_unit_tests.py
+
+      - name: Setup Xcode SDK, CMake/Meson/Ninja & codesign wrapper
+        run: |
+          sw_vers
+          ls -d /Applications/Xcode*.app || true
+          XC=""
+          if [ -n "${XCODE_VERSION:-}" ]; then
+            for cand in \
+              "/Applications/Xcode_${XCODE_VERSION}.app" \
+              "/Applications/Xcode_${XCODE_VERSION}.0.app" \
+              "/Applications/Xcode-${XCODE_VERSION}.app" \
+              "/Applications/${XCODE_VERSION}"; do
+              if [ -d "$cand" ]; then XC="$cand"; break; fi
+            done
+            if [ -z "$XC" ]; then
+              echo "::error::Requested xcode_version='${XCODE_VERSION}' not found in /Applications" >&2
+              exit 1
+            fi
+          else
+            for cand in \
+              "/Applications/Xcode_26.1.app" \
+              "/Applications/Xcode_16.4.app" \
+              "/Applications/Xcode_16.3.app" \
+              "/Applications/Xcode_16.2.app"; do
+              if [ -d "$cand" ]; then XC="$cand"; break; fi
+            done
+            if [ -z "$XC" ]; then
+              XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)
+            fi
+            if [ -z "$XC" ]; then
+              XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)
+            fi
+            if [ -z "$XC" ]; then
+              XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+            fi
+          fi
+          DEV_DIR="$XC/Contents/Developer"
+          export DEVELOPER_DIR="$DEV_DIR"
+          echo "DEVELOPER_DIR=$DEV_DIR" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$DEV_DIR"
+          xcodebuild -version
+          xcrun clang --version
+          brew install cmake meson ninja
+          sudo mkdir -p /usr/local/bin
+          cat <<'EOF' | sudo tee /usr/local/bin/ldid >/dev/null
+          #!/bin/sh
+          ent=""
+          target=""
+          for arg in "$@"; do
+            case "$arg" in
+              -S) ;;
+              -S*) ent="${arg#-S}" ;;
+              *) target="$arg" ;;
+            esac
+          done
+          if [ -n "$target" ] && [ -e "$target" ]; then
+            if [ -n "$ent" ] && [ -f "$ent" ]; then
+              codesign --force --sign - --entitlements "$ent" "$target"
+            else
+              codesign --force --sign - "$target"
+            fi
+          fi
+          EOF
+          sudo chmod +x /usr/local/bin/ldid
+          mkdir -p "$HOME/sdks"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/sdks/theos-sdks"
+
+      - name: Cache Mesa arm64e + libheif/libde265 arm64e builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/mesa-ios-26
+            userland/heif/prefix-arm64e
+          key: mesa-heif-arm64e-${{ hashFiles('userland/mesa/**', 'userland/mk-mesa.sh', 'userland/heif/build-libs.sh', 'tools/ipados26_depac.py') }}
+          restore-keys: |
+            mesa-heif-arm64e-
+
+      - name: Build Sapphire arm64e Userland + HakiosMetal + Audio + Tweaks + Apps (iPadOS 26.1)
+        run: |
+          set -e
+          # Use iPhoneOS16.5.sdk from theos-sdks for private framework TBDs (IOSurface, MediaToolbox, CoreTelephony)
+          # while compiling all slices as -target arm64e-apple-ios16.0 so iPadOS 26.1 arm64e processes load them!
+          SDK_PATH="$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk"
+          if [ ! -d "$SDK_PATH" ]; then
+            SDK_PATH=$(find "$HOME/sdks/theos-sdks" -maxdepth 1 -name "iPhoneOS*.sdk" | sort -V | tail -1)
+          fi
+          XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Private SDK: $SDK_PATH | Xcode SDK: $XCODE_SDK"
+          CLANG_BIN="$(xcrun -find clang)"
+          CLANGXX_BIN="$(xcrun -find clang++)"
+          LDID_BIN="/usr/local/bin/ldid"
+          OUT="$PWD/userland/obj-ipados26"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/tweaks" "$OUT/launchd" "$OUT/apps" "$OUT/bundles" "$OUT/etc"
+
+          TFLAGS="-target arm64e-apple-ios16.0 -isysroot $SDK_PATH -O2 -Wall -Wno-deprecated-declarations -Wno-unused-parameter"
+
+          # Stage per-device Adreno 610 Metal configuration
+          cp devices/sapphire/metal.args "$OUT/etc/metal.args"
+
+          # 1. Mesa (libOSMesa.8.dylib + libair.a) + HakiosMetal.bundle (real Adreno 610 GPU Metal) + SapphireMetal.bundle
+          ARCH=arm64e CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" SDK="$SDK_PATH" B="$HOME/mesa-ios-26" bash userland/mk-mesa.sh
+          ARCH=arm64e CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" SDK="$SDK_PATH" MESA_ROOT="$HOME/mesa-ios-26" bash metal/build-hakios.sh "$OUT/bundles"
+          ARCH=arm64e CLANG="$CLANG_BIN" sh metal/build.sh "$OUT/bundles"
+
+          # 2. EAGL bridge (libredwood-gl.dylib for OpenGLES apps) + system injected bridges (/redwood/lib/*)
+          cp "$HOME/mesa-ios-26/out/libOSMesa.8.dylib" "$OUT/lib/libOSMesa.8.dylib"
+          "$LDID_BIN" -S "$OUT/lib/libOSMesa.8.dylib"
+          ARCH=arm64e CLANG="$CLANG_BIN" SDK="$SDK_PATH" M="$HOME/mesa-ios-26/out" OUT="$OUT/lib" bash userland/build-gl.sh
+          "$LDID_BIN" -S "$OUT/lib/libredwood-gl.dylib"
+          "$LDID_BIN" -S "$OUT/lib/libredwood-glload.dylib"
+          cp -p "$OUT/lib/libredwood-gl.dylib" "$OUT/lib/eagl.dylib"
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib -undefined dynamic_lookup \
+            -install_name /redwood/lib/inject_sb.dylib -o "$OUT/lib/inject_sb.dylib" userland/src/inject_sb.c \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics -framework IOKit -lobjc -ldl -lpthread
+          "$LDID_BIN" -S "$OUT/lib/inject_sb.dylib"
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/SapphireBrightness.dylib \
+            -o "$OUT/lib/SapphireBrightness.dylib" userland/brightness/SapphireBrightness.c \
+            -framework CoreFoundation -framework IOKit -lobjc -lm
+          "$LDID_BIN" -S "$OUT/lib/SapphireBrightness.dylib"
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/bkstart" userland/brightness/bkstart.c
+          "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/bkstart"
+
+          # 3. CoreAudio HAL Plug-In (RedwoodAudio.driver) + AudioReach arplay daemon
+          mkdir -p "$OUT/bundles/RedwoodAudio.driver"
+          cp userland/audio/audio_plugin.plist "$OUT/bundles/RedwoodAudio.driver/Info.plist"
+          "$CLANG_BIN" $TFLAGS -bundle -framework CoreFoundation \
+            -o "$OUT/bundles/RedwoodAudio.driver/RedwoodAudio" userland/audio/audio_plugin.c
+          codesign --force --sign - "$OUT/bundles/RedwoodAudio.driver"
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/arplay" userland/audio/arplay/arplay.c
+          "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/arplay"
+          cp userland/audio/arplay/com.sapphire.arplay.plist "$OUT/launchd/"
+
+          # 4. Telephony & BlastDoor & Bluetooth bridges (used on Cellular iPad11,7 or Bluetooth HCI shim)
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/qmitool" userland/telephony/qmitool.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/ccstart" userland/telephony/ccstart.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/bbstart" userland/telephony/bbstart.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/pdpnet" userland/telephony/pdpnet.c \
+            -framework CoreFoundation -framework SystemConfiguration -framework CoreTelephony
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/ctdial" userland/telephony/ctdial.c -framework CoreFoundation
+          "$LDID_BIN" -Suserland/telephony/ctdial.entitlements "$OUT/bin/ctdial"
+          for b in qmitool ccstart bbstart pdpnet; do "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/$b"; done
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/ccbridge.dylib \
+            -o "$OUT/lib/ccbridge.dylib" userland/telephony/ccbridge.c -framework CoreFoundation -framework IOKit
+          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/libsapphire-fakebb.dylib \
+            -o "$OUT/lib/libsapphire-fakebb.dylib" userland/telephony/fakebb.c -framework CoreFoundation -framework IOKit
+          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/libsapphire-bdsandbox.dylib \
+            -o "$OUT/lib/libsapphire-bdsandbox.dylib" userland/telephony/bdsandbox.c
+          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/btbridge.dylib \
+            -o "$OUT/lib/btbridge.dylib" userland/bluetooth/btbridge.c -framework CoreFoundation -framework IOKit
+          for d in ccbridge.dylib libsapphire-fakebb.dylib libsapphire-bdsandbox.dylib btbridge.dylib; do
+            "$LDID_BIN" -S "$OUT/lib/$d"
+          done
+
+          # 5. Hardware Daemons + Inbox/IPA installer helpers
+          (
+            cd userland/camera/camd
+            LIB="../util.c ../stage.c ../rawio.c ../remosaic.c ../demosaic.c ../color.c ../out.c ../jpeg.c"
+            OWN="preview.c develop.c exif.c"
+            "$CLANG_BIN" $TFLAGS -std=gnu11 -ffp-contract=fast -fno-math-errno \
+              -o "$OUT/bin/camd" camd.c camk.c $OWN $LIB -framework CoreFoundation -framework IOSurface
+            "$CLANG_BIN" $TFLAGS -o "$OUT/bin/camctl" camctl.c
+            cp com.sapphire.camd.plist "$OUT/launchd/"
+          )
+          "$LDID_BIN" -Suserland/apps/SapphireTools/entitlements.plist "$OUT/bin/camd"
+          "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/camctl"
+
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/btmonitor" userland/bluetooth/btmonitor.c
+          "$CLANG_BIN" $TFLAGS -fblocks -o "$OUT/bin/btshim" userland/bluetooth/btshim.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/rtcd" userland/rtcd/rtcd.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/sensord" userland/sensors/sensord.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/vibd" userland/haptics/vibd.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/thermald" userland/thermal/thermald.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/sapphire-gpsd" userland/gps/sapphire-gpsd.c
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/faced" userland/faceid/faced.c -lm -lpthread
+          "$CLANG_BIN" $TFLAGS -o "$OUT/bin/sapphire-inboxcat" userland/update/inboxcat.c
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -framework Foundation -lz \
+            -o "$OUT/bin/sapphire-ipa-helper" userland/store/ipa_helper.m
+          cp userland/update/sapphire-ipa-install.sh userland/update/sapphire-update.sh tools/ipados26_depac.py "$OUT/bin/"
+          chmod 755 "$OUT/bin/sapphire-ipa-install.sh" "$OUT/bin/sapphire-update.sh" "$OUT/bin/ipados26_depac.py"
+
+          cp userland/faceid/com.sapphire.faced.plist \
+             userland/bluetooth/com.sapphire.btmonitor.plist \
+             userland/bluetooth/com.sapphire.btshim.plist \
+             userland/rtcd/com.sapphire.rtcd.plist \
+             userland/sensors/com.sapphire.sensord.plist \
+             userland/haptics/com.sapphire.vibd.plist \
+             userland/thermal/com.sapphire.thermald.plist \
+             userland/gps/com.sapphire.gpsd.plist \
+             userland/dualboot/com.sapphire.wifidkick.plist \
+             "$OUT/launchd/"
+          for b in btmonitor btshim rtcd sensord vibd thermald sapphire-gpsd faced sapphire-inboxcat sapphire-ipa-helper; do
+            "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/$b"
+          done
+
+          # 6. Fingerprint daemons & tweaks & Huella.app (Universal iPad/iPhone)
+          (
+            cd userland/fingerprint
+            "$CLANG_BIN" $TFLAGS -framework CoreFoundation -o "$OUT/bin/fpd" fpd.c
+            "$CLANG_BIN" $TFLAGS -o "$OUT/bin/fpload" fpload.c
+            "$CLANG_BIN" $TFLAGS -o "$OUT/bin/fpsave" fpsave.c
+            "$CLANG_BIN" $TFLAGS -o "$OUT/bin/fpctl" fpctl.c
+            for b in fpd fpload fpsave fpctl; do "$LDID_BIN" -S../rtcd/ent.xml "$OUT/bin/$b"; done
+            cp com.sapphire.fpd.plist "$OUT/launchd/"
+            for t in SapphireFingerprint SapphireFingerprintSettings SapphireBiometry; do
+              "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib -install_name "/var/jb/usr/lib/TweakInject/$t.dylib" \
+                -lobjc -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
+                -o "$OUT/tweaks/$t.dylib" "$t.m"
+              "$LDID_BIN" -S "$OUT/tweaks/$t.dylib"
+              cp "$t.plist" "$OUT/tweaks/"
+            done
+            mkdir -p "$OUT/apps/Huella.app"
+            cp app/Info.plist "$OUT/apps/Huella.app/Info.plist"
+            python3 -I app/mkicon.py 120 "$OUT/apps/Huella.app/AppIcon60x60@2x.png"
+            python3 -I app/mkicon.py 180 "$OUT/apps/Huella.app/AppIcon60x60@3x.png"
+            "$CLANG_BIN" $TFLAGS -fobjc-arc -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
+              -o "$OUT/apps/Huella.app/Huella" app/Huella.m
+            codesign --force --sign - --entitlements app/Huella.entitlements "$OUT/apps/Huella.app"
+          )
+
+          # 7. ElleKit Tweaks compatible with iPadOS 26.1 (arm64e)
+          "$CLANG_BIN" $TFLAGS -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireHaptics.dylib \
+            -framework Foundation -framework UIKit -framework AudioToolbox -ldl \
+            -o "$OUT/tweaks/SapphireHaptics.dylib" userland/haptics/SapphireHaptics.m
+          cp userland/haptics/SapphireHaptics.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireBTCapability.dylib \
+            -lobjc -framework Foundation -framework IOKit \
+            -o "$OUT/tweaks/SapphireBTCapability.dylib" userland/tweaks/btcapability/SapphireBTCapability.m
+          cp userland/tweaks/btcapability/SapphireBTCapability.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireNoCamera.dylib \
+            -framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
+            -framework IOSurface -framework QuartzCore -framework AVFoundation -lobjc \
+            -o "$OUT/tweaks/SapphireNoCamera.dylib" userland/tweaks/nocamera/SapphireNoCamera.c
+          cp userland/tweaks/nocamera/SapphireNoCamera.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireFigShim.dylib \
+            -framework CoreFoundation -framework IOSurface -lobjc \
+            -o "$OUT/tweaks/SapphireFigShim.dylib" userland/tweaks/figshim/SapphireFigShim.c
+          cp userland/tweaks/figshim/SapphireFigShim.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireAVCamera.dylib \
+            -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
+            -framework Foundation -framework IOSurface -framework QuartzCore -framework UIKit -framework Vision -lobjc \
+            -o "$OUT/tweaks/SapphireAVCamera.dylib" userland/tweaks/avcamera/SapphireAVCamera.m
+          cp userland/tweaks/avcamera/SapphireAVCamera.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireFaceID.dylib \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore -lobjc \
+            -o "$OUT/tweaks/SapphireFaceID.dylib" userland/faceid/SapphireFaceID.m
+          cp userland/faceid/SapphireFaceID.plist "$OUT/tweaks/"
+
+          # 120Hz CADisplayLink promotion, Vol+/Vol- mute switch, Safari container fix & software HEIF decoder
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireDisplayLink.dylib \
+            -framework Foundation -framework QuartzCore -lobjc \
+            -o "$OUT/tweaks/SapphireDisplayLink.dylib" userland/tweaks/displaylink/SapphireDisplayLink.m
+          cp userland/tweaks/displaylink/SapphireDisplayLink.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireButtonRegenerator.dylib \
+            -framework Foundation -lobjc \
+            -o "$OUT/tweaks/SapphireButtonRegenerator.dylib" userland/tweaks/buttonregenerator/SapphireButtonRegenerator.m
+          cp userland/tweaks/buttonregenerator/SapphireButtonRegenerator.plist "$OUT/tweaks/"
+
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireSafari.dylib \
+            -framework Foundation -lobjc \
+            -o "$OUT/tweaks/SapphireSafari.dylib" userland/tweaks/safari/SapphireSafari.m
+          cp userland/tweaks/safari/SapphireSafari.plist "$OUT/tweaks/"
+
+          if [ ! -f userland/heif/prefix-arm64e/lib/libheif.a ]; then
+            ARCH=arm64e SDK="$SDK_PATH" CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" bash userland/heif/build-libs.sh
+          fi
+          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireHEIF.dylib \
+            -Iuserland/heif/prefix-arm64e/include -DLIBHEIF_STATIC_BUILD \
+            -framework Foundation -framework ImageIO -framework CoreGraphics -lobjc \
+            -o "$OUT/tweaks/SapphireHEIF.dylib" userland/tweaks/heif/SapphireHEIF.m \
+            userland/heif/prefix-arm64e/lib/libheif.a userland/heif/prefix-arm64e/lib/libde265.a -lc++
+          cp userland/tweaks/heif/SapphireHEIF.plist "$OUT/tweaks/"
+
+          for tw in "$OUT"/tweaks/*.dylib; do "$LDID_BIN" -S "$tw"; done
+
+          # 8. Universal Apps: SapphireTools.app, Tienda.app (direct IPA store), Android.app (dual-boot switch)
+          (
+            cd userland/apps/SapphireTools
+            make clean
+            make CLANG="$CLANG_BIN" SDK="$SDK_PATH" TARGET="arm64e-apple-ios16.0" LDID="$LDID_BIN"
+            cp -R build/SapphireTools.app "$OUT/apps/"
+            "$CLANG_BIN" $TFLAGS -o "$OUT/bin/sapphire-toolsd" toolsd.c
+            "$LDID_BIN" -Sentitlements.plist "$OUT/bin/sapphire-toolsd"
+            cp com.sapphire.toolsd.plist "$OUT/launchd/"
+          )
+
+          (
+            cd userland/store
+            mkdir -p "$OUT/apps/Tienda.app"
+            cp app/Info.plist "$OUT/apps/Tienda.app/Info.plist"
+            python3 -I app/mkicon.py 120 "$OUT/apps/Tienda.app/AppIcon60x60@2x.png"
+            python3 -I app/mkicon.py 180 "$OUT/apps/Tienda.app/AppIcon60x60@3x.png"
+            "$CLANG_BIN" $TFLAGS -fobjc-arc -framework Foundation -framework UIKit -framework WebKit -framework CoreGraphics \
+              -o "$OUT/apps/Tienda.app/Tienda" app/Tienda.m
+            codesign --force --sign - --entitlements app/Tienda.entitlements "$OUT/apps/Tienda.app"
+          )
+
+          (
+            cd userland/dualboot
+            mkdir -p "$OUT/apps/Android.app"
+            cp ios-app/Info.plist "$OUT/apps/Android.app/Info.plist"
+            python3 -I ios-app/mkicon.py 120 "$OUT/apps/Android.app/AppIcon60x60@2x.png"
+            python3 -I ios-app/mkicon.py 180 "$OUT/apps/Android.app/AppIcon60x60@3x.png"
+            "$CLANG_BIN" $TFLAGS -fobjc-arc -framework Foundation -framework UIKit \
+              -o "$OUT/apps/Android.app/Android" ios-app/AndroidBoot.m
+            codesign --force --sign - --entitlements ios-app/AndroidBoot.entitlements "$OUT/apps/Android.app"
+          )
+
+          # 9. Offline arm64e -> ARMv8.0 De-PAC + CS_CodeDirectory SHA-256 page rehash across ALL outputs!
+          echo "=== Running ipados26_depac.py --rewrite on userland-26 outputs ==="
+          python3 tools/ipados26_depac.py --rewrite "$OUT"
+          echo "=== Auditing post-rewrite outputs (must have 0 PAC instructions remaining) ==="
+          python3 tools/ipados26_depac.py --audit "$OUT"
+          ls -la "$OUT/bin" "$OUT/lib" "$OUT/tweaks" "$OUT/apps" "$OUT/bundles"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-ipados26-binaries
+          path: userland/obj-ipados26/
+          retention-days: 30

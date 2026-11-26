@@ -1,0 +1,52 @@
+name: dualboot-apk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ipados-26, main]
+    paths:
+      - "android/dualboot/**"
+      - ".github/workflows/dualboot-apk.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Python Pillow
+        run: sudo apt-get update && sudo apt-get install -y python3-pil
+
+      - name: Install Android SDK 36
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;36.0.0" "platforms;android-36"
+
+      - name: Fetch Magisk libbootctl.so
+        run: |
+          URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | python3 -c "import sys, json; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('.apk')))")
+          curl -sL "$URL" -o /tmp/magisk.apk
+          unzip -j /tmp/magisk.apk "lib/arm64-v8a/libbootctl.so" -d /tmp/
+
+      - name: Build SapphireDualBoot.apk
+        env:
+          SAPPHIRE_KEYSTORE_B64: ${{ secrets.SAPPHIRE_KEYSTORE_B64 }}
+          SAPPHIRE_KEYSTORE_PASS: ${{ secrets.SAPPHIRE_KEYSTORE_PASS }}
+        run: |
+          if [ -n "$SAPPHIRE_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$SAPPHIRE_KEYSTORE_B64" | base64 -d > "$HOME/.android/sapphire-dualboot.jks"
+          fi
+          BOOTCTL=/tmp/libbootctl.so KS_PASS="${SAPPHIRE_KEYSTORE_PASS:-sapphire}" bash android/dualboot/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SapphireDualBoot-apk
+          path: android/dualboot/out/SapphireDualBoot.apk
+          if-no-files-found: error

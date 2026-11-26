@@ -1,0 +1,528 @@
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index e89717f..486a819 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3222,11 +3222,40 @@ struct msm_surface {                            /* HackiOS's struct redwood_surf
+ #define MSM_SUBMIT_CMD_BUF  1
+ #define MSM_SUBMIT_CMD_CTX_RESTORE_BUF 3
+ #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++#define MSM_BO_NOZERO       0x00100000u
+ #define MSM_DESCRIBE        0xffffffffu
+ 
++extern "C" int sweet_gpu_max_freq;              /* bsd/dev/sweet_cpufreq.c */
++
+ static uint64_t msm_bits[MSM_PAGES / 64];
+ static uint64_t msm_next;                       /* where the next search starts (next fit) */
+ 
++static void
++bits_mark(uint64_t *bits, uint64_t p0, uint64_t n, bool used)
++{
++	uint64_t p = p0, end = p0 + n;
++	while (p < end && (p & 63) != 0) {
++		if (used) {
++			bits[p >> 6] |= 1ull << (p & 63);
++		} else {
++			bits[p >> 6] &= ~(1ull << (p & 63));
++		}
++		p++;
++	}
++	while (p + 64 <= end) {
++		bits[p >> 6] = used ? ~0ull : 0ull;
++		p += 64;
++	}
++	while (p < end) {
++		if (used) {
++			bits[p >> 6] |= 1ull << (p & 63);
++		} else {
++			bits[p >> 6] &= ~(1ull << (p & 63));
++		}
++		p++;
++	}
++}
++
+ static bool
+ msm_used(uint64_t p)
+ {
+@@ -3236,13 +3265,7 @@ msm_used(uint64_t p)
+ static void
+ msm_mark(uint64_t p0, uint64_t n, bool used)
+ {
+-	for (uint64_t p = p0; p < p0 + n; p++) {
+-		if (used) {
+-			msm_bits[p >> 6] |= 1ull << (p & 63);
+-		} else {
+-			msm_bits[p >> 6] &= ~(1ull << (p & 63));
+-		}
+-	}
++	bits_mark(msm_bits, p0, n, used);
+ }
+ 
+ /* n pages of addresses, next fit, wrapping once; 0 if none */
+@@ -3252,9 +3275,19 @@ msm_va_alloc(uint64_t n)
+ 	for (int pass = 0; pass < 2; pass++) {
+ 		uint64_t start = pass == 0 ? msm_next : 0, end = pass == 0 ? MSM_PAGES : msm_next, run = 0;
+ 		for (uint64_t p = start; p < end; p++) {
+-			if ((p & 63) == 0 && run == 0 && msm_bits[p >> 6] == ~0ull) {
+-				p += 63;                /* a full word: skip it */
+-				continue;
++			if (run == 0 && (p & 63) == 0) {
++				uint64_t w = msm_bits[p >> 6];
++				if (w == ~0ull) {
++					p += 63;        /* a full word: skip it */
++					continue;
++				}
++				if (w != 0ull) {
++					uint32_t tz = (uint32_t)__builtin_ctzll(~w);
++					if (p + tz >= end) {
++						break;
++					}
++					p += tz;
++				}
+ 			}
+ 			run = msm_used(p) ? 0 : run + 1;
+ 			if (run == n) {
+@@ -3303,6 +3336,8 @@ msm_gpu_idle(void)
+ static uint64_t gpool_bits[GPOOL_PAGES / 64];
+ static uint64_t gpool_next;
+ static int gpool_on = -1;
++static IOMemoryMap *gpool_map;
++static uint8_t *gpool_kva;
+ 
+ static bool
+ gpool_enabled(void)
+@@ -3311,22 +3346,18 @@ gpool_enabled(void)
+ 		uint32_t v = 1;
+ 		(void)PE_parse_boot_argn("gpu_pool", &v, sizeof(v));
+ 		gpool_on = v != 0;
+-		LOG("msm: buffers %s", gpool_on ? "from the GPU pool 0x100000000-0x140000000, write-combined" :
+-		    "cacheable kernel memory (gpu_pool=0)");
+-	}
+-	return gpool_on;
+-}
+-
+-static void
+-bits_mark(uint64_t *bits, uint64_t p0, uint64_t n, bool used)
+-{
+-	for (uint64_t p = p0; p < p0 + n; p++) {
+-		if (used) {
+-			bits[p >> 6] |= 1ull << (p & 63);
+-		} else {
+-			bits[p >> 6] &= ~(1ull << (p & 63));
++		if (gpool_on && gpool_map == NULL) {
++			gpool_map = map_phys(GPOOL_PA, GPOOL_SIZE, true);
++			if (gpool_map != NULL) {
++				gpool_kva = (uint8_t *)gpool_map->getVirtualAddress();
++			}
+ 		}
++		LOG("msm: buffers %s (persistent kva %s)",
++		    gpool_on ? "from the GPU pool 0x100000000-0x140000000, write-combined" :
++		    "cacheable kernel memory (gpu_pool=0)",
++		    gpool_kva != NULL ? "yes" : "no");
+ 	}
++	return gpool_on;
+ }
+ 
+ /* n contiguous pages of the pool: their physical address, or 0. service_lock held. */
+@@ -3533,6 +3564,7 @@ public:
+ 	struct msm_bo  *fBo;                    /* handle n is fBo[n - 1] */
+ 	struct msm_bo  *fLeft;                  /* MSM_LEFT of them: kept until their fence */
+ 	uint32_t        fCount, fSubmits, fQueue;
++	uint32_t        fLeftUsed, fNextSlot;
+ 	uint64_t        fBytes;
+ 	thread_call_t   fReapTimer;
+ 	bool            fReapTimerArmed;
+@@ -3554,7 +3586,7 @@ public:
+ 	struct msm_bo *slot(uint32_t *handle);
+ 	bool place(struct msm_bo *b);
+ 	void drop(struct msm_bo *b);
+-	void freeBo(struct msm_bo *b);
++	void freeBo(struct msm_bo *b, bool flush = true);
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new *r);
+ 	IOReturn gemInfo(struct msm_gem_info *r);
+@@ -3587,6 +3619,7 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+ 	bzero(fBo, sizeof(struct msm_bo) * MSM_BUFFERS);
+ 	bzero(fLeft, sizeof(struct msm_bo) * MSM_LEFT);
+ 	fCount = fSubmits = fQueue = 0;
++	fLeftUsed = fNextSlot = 0;
+ 	fBytes = 0;
+ 	fReapTimer = NULL;
+ 	fReapTimerArmed = false;
+@@ -3616,8 +3649,10 @@ SapphireGPUClient::bo(uint32_t handle)
+ struct msm_bo *
+ SapphireGPUClient::slot(uint32_t *handle)
+ {
+-	for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
++	for (uint32_t n = 0; n < MSM_BUFFERS; n++) {
++		uint32_t i = (fNextSlot + n) % MSM_BUFFERS;
+ 		if (fBo[i].md == NULL) {
++			fNextSlot = (i + 1) % MSM_BUFFERS;
+ 			*handle = i + 1;
+ 			return &fBo[i];
+ 		}
+@@ -3680,7 +3715,7 @@ sapphire_gpu_census(uint32_t n[3], uint64_t bytes[3])
+ 
+ /* Free a buffer the GPU is done with. service_lock held. */
+ void
+-SapphireGPUClient::freeBo(struct msm_bo *b)
++SapphireGPUClient::freeBo(struct msm_bo *b, bool flush)
+ {
+ 	uint64_t n = b->size >> 12;
+ 
+@@ -3689,7 +3724,9 @@ SapphireGPUClient::freeBo(struct msm_bo *b)
+ 	for (uint64_t p = 0; p < n; p++) {
+ 		unmap_page_4k(b->va + (p << 12));
+ 	}
+-	(void)tlb_flush();
++	if (flush) {
++		(void)tlb_flush();
++	}
+ 	msm_mark((b->va - MSM_VA_START) >> 12, n, false);
+ 	if (b->surf != NULL) {
+ 		b->md->complete();
+@@ -3711,15 +3748,24 @@ static volatile uint32_t g_reap_timer_firings;
+ void
+ SapphireGPUClient::reap(void)
+ {
+-	for (uint32_t i = 0; fLeft != NULL && i < MSM_LEFT; i++) {
++	if (fLeft == NULL || fLeftUsed == 0) {
++		return;
++	}
++	bool reaped_any = false;
++	for (uint32_t i = 0; i < MSM_LEFT && fLeftUsed != 0; i++) {
+ 		if (fLeft[i].md != NULL && (fLeft[i].fence == 0 || msm_fence_done(fLeft[i].fence))) {
+ 			fCount++;                       /* (counted out when it was left: release counts it again) */
+ 			fBytes += fLeft[i].size;
+-			freeBo(&fLeft[i]);
++			freeBo(&fLeft[i], false);
++			fLeftUsed--;
++			reaped_any = true;
+ 			fReapCount++;
+ 			OSIncrementAtomic((volatile SInt32 *)&g_reap_total_count);
+ 		}
+ 	}
++	if (reaped_any) {
++		(void)tlb_flush();
++	}
+ }
+ 
+ void
+@@ -3807,13 +3853,18 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_reap, CTLTYPE_STRING | CTLFLAG_RD | CTLFL
+ void
+ SapphireGPUClient::drop(struct msm_bo *b)
+ {
++	uint32_t idx = (uint32_t)(b - fBo);
++	if (idx < fNextSlot) {
++		fNextSlot = idx;
++	}
+ 	if (b->fence == 0 || msm_fence_done(b->fence) || !service_ready) {
+-		freeBo(b);
++		freeBo(b, true);
+ 		return;
+ 	}
+ 	for (uint32_t i = 0; i < MSM_LEFT; i++) {
+ 		if (fLeft[i].md == NULL) {
+ 			fLeft[i] = *b;
++			fLeftUsed++;
+ 			fCount--;
+ 			fBytes -= b->size;
+ 			bzero(b, sizeof(*b));
+@@ -3825,7 +3876,7 @@ SapphireGPUClient::drop(struct msm_bo *b)
+ 		msm_hung(fName, b->fence, false);
+ 	}
+ 	IOLockLock(service_lock);
+-	freeBo(b);
++	freeBo(b, true);
+ }
+ 
+ void
+@@ -3851,18 +3902,25 @@ SapphireGPUClient::clientClose(void)
+ 		msm_hung(fName, msm_seq, false);
+ 	}
+ 	IOLockLock(service_lock);
++	bool freed_any = false;
+ 	for (uint32_t i = 0; fBo != NULL && i < MSM_BUFFERS; i++) {
+ 		if (fBo[i].md != NULL) {
+-			freeBo(&fBo[i]);
++			freeBo(&fBo[i], false);
++			freed_any = true;
+ 		}
+ 	}
+ 	for (uint32_t i = 0; fLeft != NULL && i < MSM_LEFT; i++) {
+ 		if (fLeft[i].md != NULL) {
+ 			fCount++;
+ 			fBytes += fLeft[i].size;
+-			freeBo(&fLeft[i]);
++			freeBo(&fLeft[i], false);
++			freed_any = true;
+ 		}
+ 	}
++	fLeftUsed = 0;
++	if (freed_any) {
++		(void)tlb_flush();
++	}
+ 	IOLockUnlock(service_lock);
+ 	LOG("msm: %s closed (%u submissions)", fName, fSubmits);
+ 	if (fBo != NULL) {
+@@ -3906,15 +3964,17 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (gpool_enabled()) {
+-		uint32_t retries = 5, base_ms = 2;
+-		(void)PE_parse_boot_argn("sweet_gpu_alloc_retry", &retries, sizeof(retries));
+-		(void)PE_parse_boot_argn("sweet_gpu_alloc_sleep_ms", &base_ms, sizeof(base_ms));
+-		if (retries < 1 || retries > 20) {
+-			retries = 5;
+-		}
+-		if (base_ms < 1 || base_ms > 200) {
+-			base_ms = 2;
++		static int alloc_cfg_ready = 0;
++		static uint32_t cached_retries = 5, cached_base_ms = 2;
++		if (!alloc_cfg_ready) {
++			uint32_t r_arg = 5, s_arg = 2;
++			(void)PE_parse_boot_argn("sweet_gpu_alloc_retry", &r_arg, sizeof(r_arg));
++			(void)PE_parse_boot_argn("sweet_gpu_alloc_sleep_ms", &s_arg, sizeof(s_arg));
++			cached_retries = (r_arg >= 1 && r_arg <= 20) ? r_arg : 5;
++			cached_base_ms = (s_arg >= 1 && s_arg <= 200) ? s_arg : 2;
++			alloc_cfg_ready = 1;
+ 		}
++		uint32_t retries = cached_retries, base_ms = cached_base_ms;
+ 		uint64_t pa = 0;
+ 		for (uint32_t attempt = 0; attempt < retries; attempt++) {
+ 			IOLockLock(service_lock);
+@@ -3936,30 +3996,28 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+ 		}
+ 		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
+ 		/*
+-		 * 0205: zeroed only when small. CoreAnimation makes and drops screen-sized textures many
+-		 * times a second while it animates (render targets it then draws all of); mapping 11 MB into
+-		 * the kernel and zeroing it write-combined made every such GEM_NEW cost 0.5 ms and more on
+-		 * Mesa's driver thread. Small buffers (state, queries) are still zeroed; boot-arg gpu_zero=1:
+-		 * every buffer, as before.
+-		 * 0215: gpu_zero=1 is the default again: with 0205 folders opening in the dark appearance
+-		 * showed white frames (and once the whole screen went yellow), which gpu_zero=1 took away.
++		 * 0205/0215 + ipados26 opt: zero directly through persistent 1 GiB WC gpool_kva mapping
++		 * (0 pmap_enter/pmap_remove calls, 0 cross-CPU TLB shootdown IPIs!), skipping zeroing
++		 * when caller passes MSM_BO_NOZERO (overwrite-only staging / command buffers).
+ 		 */
+ 		static int zero_all = -1;
+ 		if (zero_all < 0) {
+-			int z = 1;              /* 0215: on by default again (gpu_zero=0: 0205's way); see below */
++			int z = 1;
+ 			PE_parse_boot_argn("gpu_zero", &z, sizeof(z));
+ 			zero_all = z != 0;
+ 		}
+ 		bool zeroed = pm != NULL;
+-		if (pm != NULL) {
+-			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
+-			if (km != NULL) {
+-				if (zero_all || size < 256 * 1024) {
++		if (pm != NULL && !(r->flags & MSM_BO_NOZERO) && (zero_all || size < 256 * 1024)) {
++			if (gpool_kva != NULL) {
++				bzero(gpool_kva + (pa - GPOOL_PA), size);
++			} else {
++				IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
++				if (km != NULL) {
+ 					bzero((void *)km->getVirtualAddress(), size);
++					km->release();
++				} else {
++					zeroed = false;
+ 				}
+-				km->release();
+-			} else {
+-				zeroed = false;
+ 			}
+ 		}
+ 		IOLockLock(service_lock);
+@@ -4113,16 +4171,29 @@ SapphireGPUClient::surface(struct msm_surface *r)
+ IOReturn
+ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ {
++	struct msm_gem_submit_bo stack_bos[64];
++	struct msm_gem_submit_cmd stack_cmds[16];
+ 	struct msm_gem_submit_bo *bos = NULL;
+ 	struct msm_gem_submit_cmd *cmds = NULL;
++	bool heap_bos = false, heap_cmds = false;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (r->nr_cmds == 0 || r->nr_cmds > MSM_SUBMIT_CMDS || r->nr_bos == 0 || r->nr_bos > MSM_SUBMIT_BOS) {
+ 		LOG("msm: %s: a submission of %u commands in %u buffers: not taken", fName, r->nr_cmds, r->nr_bos);
+ 		return kIOReturnBadArgument;
+ 	}
+-	bos = IONew(struct msm_gem_submit_bo, r->nr_bos);
+-	cmds = IONew(struct msm_gem_submit_cmd, r->nr_cmds);
++	if (r->nr_bos <= 64) {
++		bos = stack_bos;
++	} else {
++		bos = IONew(struct msm_gem_submit_bo, r->nr_bos);
++		heap_bos = true;
++	}
++	if (r->nr_cmds <= 16) {
++		cmds = stack_cmds;
++	} else {
++		cmds = IONew(struct msm_gem_submit_cmd, r->nr_cmds);
++		heap_cmds = true;
++	}
+ 	if (bos == NULL || cmds == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 		goto out;
+@@ -4218,10 +4289,10 @@ SapphireGPUClient::submitIt(struct msm_gem_submit *r)
+ 	}
+ 	IOLockUnlock(service_lock);
+ out:
+-	if (bos != NULL) {
++	if (heap_bos && bos != NULL) {
+ 		IODelete(bos, struct msm_gem_submit_bo, r->nr_bos);
+ 	}
+-	if (cmds != NULL) {
++	if (heap_cmds && cmds != NULL) {
+ 		IODelete(cmds, struct msm_gem_submit_cmd, r->nr_cmds);
+ 	}
+ 	return ret;
+@@ -4235,7 +4306,7 @@ msm_param(uint32_t which, uint64_t *value)
+ 	case 0x01: *value = 610; return true;                   /* GPU_ID */
+ 	case 0x02: *value = 128 * 1024; return true;            /* GMEM_SIZE */
+ 	case 0x03: *value = 0x06010001; return true;            /* CHIP_ID (a610 v2, read off the GPU) */
+-	case 0x04: *value = 600000000; return true;             /* MAX_FREQ (nominal) */
++	case 0x04: *value = sweet_gpu_max_freq > 0 ? (uint64_t)sweet_gpu_max_freq : 600000000ull; return true; /* MAX_FREQ */
+ 	case 0x05: *value = mach_absolute_time(); return true;  /* TIMESTAMP */
+ 	case 0x06: *value = 0x100000; return true;              /* GMEM_BASE: UCHE_GMEM_RANGE_MIN of hw_init */
+ 	case 0x07: *value = 1; return true;                     /* PRIORITIES */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index caba3e8..4141f6e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,7 @@ extern "C" unsigned int vm_page_wire_count;        /* osfmk/vm (the same kernel)
+ extern "C" void sapphire_gpu_init(void);            /* iokit/Kernel/arm/SapphireGpu.cpp (boot-arg gpu=N) */
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
++extern "C" void sweet_cpufreq_panel_notify(int awake); /* bsd/dev/sweet_cpufreq.c */
+ extern bool sapphire_gpu_copy_pending(void);         /* SapphireGpu.cpp (0212): the last copy is still queued */
+ 
+ /*
+@@ -1623,6 +1624,76 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	return ok;
+ }
+ 
++static inline uint32_t
++sweet_fb_blend_one(uint32_t fg, uint32_t bg)
++{
++	uint32_t a8 = fg >> 24;
++	if (a8 == 0xffu) {
++		return fg;
++	}
++	if (a8 == 0u) {
++		return bg;
++	}
++	uint32_t ia = 255u - a8;
++	uint32_t rb = (bg & 0x00ff00ffu) * ia + 0x00800080u;
++	rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++	uint32_t g = ((bg >> 8) & 0xffu) * ia + 0x80u;
++	g = ((g + (g >> 8)) >> 8) << 8;
++	uint32_t b_out = (fg & 0xffu) + (rb & 0xffu);
++	uint32_t g_out = ((fg >> 8) & 0xffu) + ((g >> 8) & 0xffu);
++	uint32_t r_out = ((fg >> 16) & 0xffu) + ((rb >> 16) & 0xffu);
++	if (b_out > 255u) {
++		b_out = 255u;
++	}
++	if (g_out > 255u) {
++		g_out = 255u;
++	}
++	if (r_out > 255u) {
++		r_out = 255u;
++	}
++	return 0xff000000u | (r_out << 16) | (g_out << 8) | b_out;
++}
++
++/*
++ * 64-bit SWAR premultiplied BGRA8888 alpha-over compositor (2 pixels per GP word).
++ * Safe under -mgeneral-regs-only (never touches user V0..V31) and skips reading
++ * Write-Combined flip buffers when pixel pairs are fully transparent or opaque.
++ */
++static void
++sweet_fb_blend_row(uint32_t *dst, const uint32_t *src, uint32_t count)
++{
++	uint32_t x = 0;
++	if ((((uintptr_t)dst | (uintptr_t)src) & 7u) == 0) {
++		for (; x + 2 <= count; x += 2) {
++			uint64_t fg2 = *(const uint64_t *)(src + x);
++			uint64_t a2 = fg2 & 0xff000000ff000000ull;
++			if (a2 == 0ull) {
++				continue;
++			}
++			if (a2 == 0xff000000ff000000ull) {
++				*(uint64_t *)(dst + x) = fg2;
++				continue;
++			}
++			uint64_t bg2 = *(const uint64_t *)(dst + x);
++			uint32_t lo = sweet_fb_blend_one((uint32_t)fg2, (uint32_t)bg2);
++			uint32_t hi = sweet_fb_blend_one((uint32_t)(fg2 >> 32), (uint32_t)(bg2 >> 32));
++			*(uint64_t *)(dst + x) = ((uint64_t)hi << 32) | (uint64_t)lo;
++		}
++	}
++	for (; x < count; x++) {
++		uint32_t fg = src[x];
++		uint32_t a8 = fg >> 24;
++		if (a8 == 0u) {
++			continue;
++		}
++		if (a8 == 0xffu) {
++			dst[x] = fg;
++		} else {
++			dst[x] = sweet_fb_blend_one(fg, dst[x]);
++		}
++	}
++}
++
+ bool
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -1887,7 +1958,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    dbase + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes, (uint32_t)w, (uint32_t)h,
+ 			    dbase, (uint64_t)fRowBytes * fHeight)) {
+ 				uint64_t t2 = mach_absolute_time();
+-				if (fFlip[0] != NULL) {
++				if (fFlip[0] != NULL && sweet_fb_flipflush) {
+ 					sweet_dcache_flush((vm_offset_t)(dst + (uint64_t)dy * fRowBytes), (unsigned)((uint64_t)h * fRowBytes));
+ 				}
+ 				gpu_used = true;
+@@ -1904,10 +1975,25 @@ AppleCLCD::present(const uint8_t *rec)
+ 			for (unsigned i = 0; fFlipWait && i < 200 && sapphire_gpu_copy_pending(); i++) {
+ 				IODelay(100);
+ 			}
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (layer == 0) {
++				if (dx == 0 && sx == 0 && (uint32_t)w * 4 == fRowBytes && s->bytesPerRow == fRowBytes) {
++					memcpy((void *)(dst + (uint64_t)dy * fRowBytes),
++					    (const void *)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
++					    (size_t)h * fRowBytes);
++				} else {
++					for (int32_t y = 0; y < h; y++) {
++						memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++						    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++						    (size_t)w * 4);
++					}
++				}
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					sweet_fb_blend_row(
++					    (uint32_t *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (uint32_t)w);
++				}
+ 			}
+ 			cpu_drawn = true;
+ 		}
+@@ -2161,6 +2247,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
++			if (changed) {
++				sweet_cpufreq_panel_notify(off ? 0 : 1);
++			}
+ 			if (changed && fFB->fDsi != NULL) {
+ 				if (off) {
+ 					fFB->setPanelOn(false);

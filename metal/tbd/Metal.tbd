@@ -1,0 +1,16 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios, arm64e-ios ]
+install-name:    '/System/Library/Frameworks/Metal.framework/Metal'
+current-version: 306.6.6
+exports:
+  - targets:     [ arm64-ios, arm64e-ios ]
+    symbols:     [ _MTLCreateSystemDefaultDevice, _MTLCommandBufferErrorDomain ]
+    objc-classes: [ _MTLDevice, _MTLObjectWithLabel, _MTLResource,
+                    _MTLCommandQueue, _MTLCommandBuffer, _MTLCommandEncoder,
+                    _MTLComputePipelineState, _MTLRenderPipelineState,
+                    _MTLSamplerState, _MTLDepthStencilState, _MTLTexture,
+                    _MTLBuffer, _MTLHeap, _MTLEvent, _MTLFence, _MTLFunction,
+                    _MTLLibrary, _MTLPipelineCache, _MTLArgumentEncoder,
+                    _MTLParallelRenderCommandEncoder ]
+...

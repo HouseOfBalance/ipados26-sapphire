@@ -1,0 +1,677 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 45c7afb..67eb006 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1281,8 +1281,8 @@ sweet_emulate_armv83_pac(arm_saved_state_t *state, uint32_t instr)
+ 		add_saved_state_pc(state, 4);
+ 		return true;
+ 	}
+-	if ((instr & 0xFFFFFFE0U) == 0xD50B7C20U) {
+-		/* ARMv8.2 DC CVAP Xt -> clean data cache line to PoC & advance */
++	if ((instr & 0xFFFFFFE0U) == 0xD50B7C20U || (instr & 0xFFFFFFE0U) == 0xD50B7D20U) {
++		/* ARMv8.2 DC CVAP / ARMv8.5 DC CVADP Xt -> PoP == PoC on Sapphire LPDDR4X */
+ 		add_saved_state_pc(state, 4);
+ 		return true;
+ 	}
+@@ -1431,6 +1431,651 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 	add_saved_state_pc(state, 4);
+ 	return true;
+ }
++
++/*
++ * Pure-integer IEEE-754 ARMv8.2 FEAT_FP16 (scalar + ASIMDHP .4H/.8H) & ARMv8.1 FEAT_RDM
++ * (SQRDMLAH / SQRDMLSH) emulator for Kryo 260 (Cortex-A73/A53, ARMv8.0-A).
++ *
++ * Compiles cleanly under -mgeneral-regs-only (zero float/double/NEON instructions):
++ * every finite binary16 is an exact int64_t multiple of 2^-24 (|v| < 2^40), allowing
++ * single-rounding IEEE-754 RNE results across FADD/FSUB/FMUL/FDIV/FSQRT/FMADD/FMLA.
++ */
++static inline bool
++sweet_fp16_isnan(uint16_t h)
++{
++	return (h & 0x7FFFU) > 0x7C00U;
++}
++
++static inline bool
++sweet_fp16_isinf(uint16_t h)
++{
++	return (h & 0x7FFFU) == 0x7C00U;
++}
++
++static inline int64_t
++sweet_fp16_to_val24(uint16_t h)
++{
++	uint32_t exp = (h >> 10) & 0x1FU;
++	uint32_t frac = h & 0x03FFU;
++	int64_t mag = (exp == 0) ? (int64_t)frac : ((int64_t)(0x0400U | frac) << (exp - 1U));
++	return (h & 0x8000U) ? -mag : mag;
++}
++
++/* Convert signed integer `val * 2^scale` to IEEE-754 binary16 (round-to-nearest-even). */
++static uint16_t
++sweet_s128_to_fp16(__int128 val, int scale, bool neg_zero)
++{
++	if (val == 0) {
++		return neg_zero ? 0x8000U : 0x0000U;
++	}
++	uint16_t sign = val < 0 ? 0x8000U : 0x0000U;
++	unsigned __int128 mag = val < 0 ? (unsigned __int128)(-(val + 1)) + 1U : (unsigned __int128)val;
++
++	int msb = 0;
++	uint64_t hi = (uint64_t)(mag >> 64);
++	if (hi != 0) {
++		msb = 127 - __builtin_clzll(hi);
++	} else {
++		msb = 63 - __builtin_clzll((uint64_t)mag);
++	}
++	int exp_unbiased = msb + scale;
++	if (exp_unbiased > 15) {
++		return sign | 0x7C00U; /* overflow -> +-Inf */
++	}
++	if (exp_unbiased < -25) {
++		return sign; /* underflow -> +-0 */
++	}
++	int shift;
++	uint32_t biased_exp;
++	if (exp_unbiased >= -14) {
++		biased_exp = (uint32_t)(exp_unbiased + 15);
++		shift = msb - 10;
++	} else {
++		biased_exp = 0;
++		shift = -24 - scale;
++	}
++	uint32_t mant11;
++	bool round_up = false;
++	if (shift <= 0) {
++		mant11 = (uint32_t)(mag << (-shift));
++	} else if (shift >= 128) {
++		return sign;
++	} else {
++		mant11 = (uint32_t)(mag >> shift);
++		unsigned __int128 half = (unsigned __int128)1U << (shift - 1);
++		unsigned __int128 rem = mag & ((half << 1) - 1U);
++		round_up = (rem > half) || (rem == half && (mant11 & 1U));
++	}
++	if (biased_exp > 0) {
++		mant11 &= 0x03FFU;
++	}
++	uint16_t res = (uint16_t)(sign | (biased_exp << 10) | mant11);
++	if (round_up) {
++		res++;
++	}
++	return res;
++}
++
++static uint16_t
++sweet_fp16_add(uint16_t a, uint16_t b, bool sub)
++{
++	if (sub) {
++		b ^= 0x8000U;
++	}
++	if (sweet_fp16_isnan(a) || sweet_fp16_isnan(b)) {
++		return 0x7E00U;
++	}
++	if (sweet_fp16_isinf(a) || sweet_fp16_isinf(b)) {
++		if (sweet_fp16_isinf(a) && sweet_fp16_isinf(b) && ((a ^ b) & 0x8000U)) {
++			return 0x7E00U; /* Inf - Inf = NaN */
++		}
++		return sweet_fp16_isinf(a) ? a : b;
++	}
++	int64_t s = sweet_fp16_to_val24(a) + sweet_fp16_to_val24(b);
++	bool nz = (s == 0) && ((a & 0x8000U) != 0) && ((b & 0x8000U) != 0);
++	return sweet_s128_to_fp16((__int128)s, -24, nz);
++}
++
++static uint16_t
++sweet_fp16_mul(uint16_t a, uint16_t b, bool mulx)
++{
++	uint16_t sign = (a ^ b) & 0x8000U;
++	if (sweet_fp16_isnan(a) || sweet_fp16_isnan(b)) {
++		return 0x7E00U;
++	}
++	bool ia = sweet_fp16_isinf(a), ib = sweet_fp16_isinf(b);
++	bool za = (a & 0x7FFFU) == 0, zb = (b & 0x7FFFU) == 0;
++	if ((ia && zb) || (ib && za)) {
++		return mulx ? (sign | 0x4000U) : 0x7E00U; /* FMULX: +-2.0, FMUL: NaN */
++	}
++	if (ia || ib) {
++		return sign | 0x7C00U;
++	}
++	__int128 p = (__int128)sweet_fp16_to_val24(a) * (__int128)sweet_fp16_to_val24(b);
++	return sweet_s128_to_fp16(p, -48, sign != 0);
++}
++
++static uint16_t
++sweet_fp16_fma(uint16_t addend, uint16_t a, uint16_t b, bool neg_prod, bool neg_all)
++{
++	if (sweet_fp16_isnan(addend) || sweet_fp16_isnan(a) || sweet_fp16_isnan(b)) {
++		return 0x7E00U;
++	}
++	bool ia = sweet_fp16_isinf(a), ib = sweet_fp16_isinf(b), ic = sweet_fp16_isinf(addend);
++	bool za = (a & 0x7FFFU) == 0, zb = (b & 0x7FFFU) == 0;
++	if ((ia && zb) || (ib && za)) {
++		return 0x7E00U;
++	}
++	uint16_t psign = ((a ^ b) & 0x8000U) ^ (neg_prod ? 0x8000U : 0U);
++	if (ia || ib) {
++		if (ic && ((addend & 0x8000U) != psign)) {
++			return 0x7E00U;
++		}
++		uint16_t r = psign | 0x7C00U;
++		return neg_all ? (r ^ 0x8000U) : r;
++	}
++	if (ic) {
++		return neg_all ? (addend ^ 0x8000U) : addend;
++	}
++	__int128 prod = (__int128)sweet_fp16_to_val24(a) * (__int128)sweet_fp16_to_val24(b);
++	if (neg_prod) {
++		prod = -prod;
++	}
++	__int128 sum = ((__int128)sweet_fp16_to_val24(addend) << 24) + prod;
++	bool nz = (sum == 0) && (((addend & 0x8000U) != 0) && (psign != 0));
++	if (neg_all) {
++		sum = -sum;
++		nz = !nz;
++	}
++	return sweet_s128_to_fp16(sum, -48, nz);
++}
++
++static uint16_t
++sweet_fp16_div(uint16_t a, uint16_t b)
++{
++	uint16_t sign = (a ^ b) & 0x8000U;
++	if (sweet_fp16_isnan(a) || sweet_fp16_isnan(b)) {
++		return 0x7E00U;
++	}
++	bool ia = sweet_fp16_isinf(a), ib = sweet_fp16_isinf(b);
++	bool za = (a & 0x7FFFU) == 0, zb = (b & 0x7FFFU) == 0;
++	if ((ia && ib) || (za && zb)) {
++		return 0x7E00U;
++	}
++	if (ia || zb) {
++		return sign | 0x7C00U;
++	}
++	if (ib || za) {
++		return sign;
++	}
++	int64_t va = sweet_fp16_to_val24(a), vb = sweet_fp16_to_val24(b);
++	uint64_t ma = (uint64_t)(va < 0 ? -va : va);
++	uint64_t mb = (uint64_t)(vb < 0 ? -vb : vb);
++	unsigned __int128 num = (unsigned __int128)ma << 52;
++	unsigned __int128 q = num / mb;
++	if ((num % mb) != 0) {
++		q |= 1U;
++	}
++	return sweet_s128_to_fp16(sign ? -(__int128)q : (__int128)q, -52, sign != 0);
++}
++
++static uint16_t
++sweet_fp16_sqrt(uint16_t a)
++{
++	if (sweet_fp16_isnan(a)) {
++		return 0x7E00U;
++	}
++	if ((a & 0x7FFFU) == 0) {
++		return a; /* sqrt(+-0) = +-0 */
++	}
++	if (a & 0x8000U) {
++		return 0x7E00U;
++	}
++	if (sweet_fp16_isinf(a)) {
++		return 0x7C00U;
++	}
++	/* a = ma * 2^-24 => sqrt(a) = sqrt(ma * 2^56) * 2^-40 */
++	unsigned __int128 rad = (unsigned __int128)(uint64_t)sweet_fp16_to_val24(a) << 56;
++	uint64_t root = 0;
++	for (int bit = 48; bit >= 0; bit--) {
++		uint64_t cand = root | (1ULL << bit);
++		if ((unsigned __int128)cand * (unsigned __int128)cand <= rad) {
++			root = cand;
++		}
++	}
++	if ((unsigned __int128)root * (unsigned __int128)root != rad) {
++		root |= 1ULL;
++	}
++	return sweet_s128_to_fp16((__int128)root, -40, false);
++}
++
++static uint16_t
++sweet_fp16_minmax(uint16_t a, uint16_t b, bool is_max, bool nm)
++{
++	bool na = sweet_fp16_isnan(a), nb = sweet_fp16_isnan(b);
++	if (na && nb) {
++		return 0x7E00U;
++	}
++	if (na || nb) {
++		if (nm && !((na && ((a & 0x0200U) == 0)) || (nb && ((b & 0x0200U) == 0)))) {
++			return na ? b : a; /* FMAXNM/FMINNM returns number against qNaN */
++		}
++		return 0x7E00U;
++	}
++	if (((a | b) & 0x7FFFU) == 0) {
++		return is_max ? (a & b) : (a | b); /* max(+0, -0) = +0, min(+0, -0) = -0 */
++	}
++	int32_t oa = (a & 0x8000U) ? -(int32_t)(a & 0x7FFFU) : (int32_t)(a & 0x7FFFU);
++	int32_t ob = (b & 0x8000U) ? -(int32_t)(b & 0x7FFFU) : (int32_t)(b & 0x7FFFU);
++	return (is_max ? (oa >= ob) : (oa <= ob)) ? a : b;
++}
++
++static uint16_t
++sweet_fp16_rint(uint16_t h, uint32_t rmode)
++{
++	/* rmode: 0=N(ties-even), 1=P(+inf), 2=M(-inf), 3=Z(zero), 4=A(ties-away) */
++	if (sweet_fp16_isnan(h)) {
++		return 0x7E00U;
++	}
++	if (sweet_fp16_isinf(h) || (h & 0x7FFFU) == 0) {
++		return h;
++	}
++	int64_t v24 = sweet_fp16_to_val24(h);
++	bool neg = (h & 0x8000U) != 0;
++	uint64_t mag = (uint64_t)(v24 < 0 ? -v24 : v24);
++	uint64_t whole = mag >> 24;
++	uint64_t frac = mag & 0xFFFFFFULL;
++	bool inc = false;
++	switch (rmode) {
++	case 0: inc = (frac > 0x800000ULL) || (frac == 0x800000ULL && (whole & 1ULL)); break;
++	case 1: inc = !neg && (frac != 0); break;
++	case 2: inc = neg && (frac != 0); break;
++	case 3: inc = false; break;
++	case 4: inc = (frac >= 0x800000ULL); break;
++	default: break;
++	}
++	if (inc) {
++		whole++;
++	}
++	__int128 signed_w = neg ? -(__int128)whole : (__int128)whole;
++	return sweet_s128_to_fp16(signed_w, 0, neg);
++}
++
++static uint64_t
++sweet_fp16_to_int(uint16_t h, bool is_unsigned, bool is64, uint32_t rmode)
++{
++	if (sweet_fp16_isnan(h)) {
++		return 0;
++	}
++	bool neg = (h & 0x8000U) != 0;
++	if (sweet_fp16_isinf(h)) {
++		if (is_unsigned) {
++			return neg ? 0ULL : (is64 ? ~0ULL : 0xFFFFFFFFULL);
++		}
++		return is64 ? (neg ? 0x8000000000000000ULL : 0x7FFFFFFFFFFFFFFFULL) :
++		    (uint64_t)(uint32_t)(neg ? 0x80000000U : 0x7FFFFFFFU);
++	}
++	int64_t v24 = sweet_fp16_to_val24(h);
++	uint64_t mag = (uint64_t)(v24 < 0 ? -v24 : v24);
++	uint64_t whole = mag >> 24;
++	uint64_t frac = mag & 0xFFFFFFULL;
++	bool inc = false;
++	switch (rmode) {
++	case 0: inc = (frac > 0x800000ULL) || (frac == 0x800000ULL && (whole & 1ULL)); break;
++	case 1: inc = !neg && (frac != 0); break;
++	case 2: inc = neg && (frac != 0); break;
++	case 3: inc = false; break;
++	case 4: inc = (frac >= 0x800000ULL); break;
++	default: break;
++	}
++	if (inc) {
++		whole++;
++	}
++	if (is_unsigned) {
++		if (neg && whole != 0) {
++			return 0;
++		}
++		return is64 ? whole : (whole & 0xFFFFFFFFULL);
++	}
++	int64_t sres = neg ? -(int64_t)whole : (int64_t)whole;
++	return is64 ? (uint64_t)sres : (uint64_t)(uint32_t)(int32_t)sres;
++}
++
++static bool
++sweet_cond_holds(uint32_t cond, uint32_t cpsr)
++{
++	uint32_t n = (cpsr >> 31) & 1U, z = (cpsr >> 30) & 1U, c = (cpsr >> 29) & 1U, v = (cpsr >> 28) & 1U;
++	bool r = false;
++	switch (cond >> 1) {
++	case 0: r = (z == 1); break;
++	case 1: r = (c == 1); break;
++	case 2: r = (n == 1); break;
++	case 3: r = (v == 1); break;
++	case 4: r = (c == 1 && z == 0); break;
++	case 5: r = (n == v); break;
++	case 6: r = (n == v && z == 0); break;
++	default: return true;
++	}
++	return ((cond & 1U) && cond != 0xFU) ? !r : r;
++}
++
++static uint32_t
++sweet_fp16_cmp_nzcv(uint16_t a, uint16_t b)
++{
++	if (sweet_fp16_isnan(a) || sweet_fp16_isnan(b)) {
++		return 0x3U; /* N=0, Z=0, C=1, V=1 (unordered) */
++	}
++	if (((a | b) & 0x7FFFU) == 0 || a == b) {
++		return 0x6U; /* N=0, Z=1, C=1, V=0 (equal) */
++	}
++	int32_t oa = (a & 0x8000U) ? -(int32_t)(a & 0x7FFFU) : (int32_t)(a & 0x7FFFU);
++	int32_t ob = (b & 0x8000U) ? -(int32_t)(b & 0x7FFFU) : (int32_t)(b & 0x7FFFU);
++	return (oa < ob) ? 0x8U : 0x2U;
++}
++
++static inline uint16_t
++sweet_q_get_h(const arm_neon_saved_state64_t *ns, uint32_t reg, uint32_t lane)
++{
++	__uint128_t q = ns->v.q[reg];
++	return (uint16_t)(q >> (16U * lane));
++}
++
++static inline int32_t
++sweet_q_get_s(const arm_neon_saved_state64_t *ns, uint32_t reg, uint32_t lane)
++{
++	__uint128_t q = ns->v.q[reg];
++	return (int32_t)(uint32_t)(q >> (32U * lane));
++}
++
++static bool
++sweet_emulate_fp16_rdm(arm_saved_state_t *state, uint32_t instr)
++{
++	thread_t th = current_thread();
++	if (th == THREAD_NULL || th->machine.uNeon == NULL) {
++		return false;
++	}
++	arm_neon_saved_state64_t *ns = neon_state64(th->machine.uNeon);
++	uint32_t rd = instr & 31U, rn = (instr >> 5) & 31U, rm = (instr >> 16) & 31U;
++
++	/* 1. ARMv8.1 FEAT_RDM: SQRDMLAH / SQRDMLSH (vector & scalar, 3-same & by-element) */
++	if ((instr & 0xBF20F400U) == 0x2E008400U || (instr & 0xFF20F400U) == 0x7E008400U ||
++	    (instr & 0xBF00D400U) == 0x2F00D000U || (instr & 0xFF00D400U) == 0x7F00D000U) {
++		bool is_scalar = ((instr >> 28) & 1U) != 0;
++		bool by_elem = ((instr >> 24) & 1U) != 0;
++		uint32_t sz = (instr >> 22) & 3U;
++		if (sz != 1U && sz != 2U) {
++			return false;
++		}
++		bool sub = by_elem ? (((instr >> 13) & 1U) != 0) : (((instr >> 11) & 1U) != 0);
++		uint32_t qbit = is_scalar ? 0U : ((instr >> 30) & 1U);
++		uint32_t lanes = is_scalar ? 1U : ((sz == 1U ? 4U : 2U) << qbit);
++		uint32_t elem_rm = rm, elem_idx = 0;
++		if (by_elem) {
++			uint32_t h = (instr >> 11) & 1U, l = (instr >> 21) & 1U, m = (instr >> 20) & 1U;
++			if (sz == 1U) {
++				elem_rm = rm & 0xFU;
++				elem_idx = (h << 2) | (l << 1) | m;
++			} else {
++				elem_rm = (m << 4) | (rm & 0xFU);
++				elem_idx = (h << 1) | l;
++			}
++		}
++		__uint128_t out_q = 0;
++		if (sz == 1U) {
++			for (uint32_t i = 0; i < lanes; i++) {
++				int16_t va = (int16_t)sweet_q_get_h(ns, rd, i);
++				int16_t vn = (int16_t)sweet_q_get_h(ns, rn, i);
++				int16_t vm = (int16_t)sweet_q_get_h(ns, by_elem ? elem_rm : rm, by_elem ? elem_idx : i);
++				int64_t acc = ((int64_t)va << 15) + (1LL << 14) + (sub ? -2LL : 2LL) * (int64_t)vn * (int64_t)vm;
++				int64_t r = acc >> 15;
++				if (r > 32767) r = 32767;
++				else if (r < -32768) r = -32768;
++				out_q |= (__uint128_t)(uint16_t)(int16_t)r << (16U * i);
++			}
++		} else {
++			for (uint32_t i = 0; i < lanes; i++) {
++				int32_t va = sweet_q_get_s(ns, rd, i);
++				int32_t vn = sweet_q_get_s(ns, rn, i);
++				int32_t vm = sweet_q_get_s(ns, by_elem ? elem_rm : rm, by_elem ? elem_idx : i);
++				__int128 acc = ((__int128)va << 31) + ((__int128)1 << 30) +
++				    (sub ? (__int128)-2 : (__int128)2) * (__int128)vn * (__int128)vm;
++				__int128 r = acc >> 31;
++				if (r > 2147483647LL) r = 2147483647LL;
++				else if (r < -2147483648LL) r = -2147483648LL;
++				out_q |= (__uint128_t)(uint32_t)(int32_t)r << (32U * i);
++			}
++		}
++		ns->v.q[rd] = out_q;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 2. Scalar FP16 3-source: FMADD / FMSUB / FNMADD / FNMSUB Hd, Hn, Hm, Ha */
++	if ((instr & 0xFFC00000U) == 0x1FC00000U) {
++		uint32_t ra = (instr >> 10) & 31U;
++		bool o1 = ((instr >> 21) & 1U) != 0, o0 = ((instr >> 15) & 1U) != 0;
++		uint16_t res = sweet_fp16_fma(sweet_q_get_h(ns, ra, 0), sweet_q_get_h(ns, rn, 0),
++		    sweet_q_get_h(ns, rm, 0), o0, o1);
++		ns->v.q[rd] = (__uint128_t)res;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 3. Scalar FP16 2-source: FMUL/FDIV/FADD/FSUB/FMAX/FMIN/FMAXNM/FMINNM/FNMUL Hd, Hn, Hm */
++	if ((instr & 0xFFE00C00U) == 0x1EE00800U) {
++		uint32_t opc = (instr >> 12) & 0xFU;
++		uint16_t a = sweet_q_get_h(ns, rn, 0), b = sweet_q_get_h(ns, rm, 0), res = 0;
++		switch (opc) {
++		case 0: res = sweet_fp16_mul(a, b, false); break;
++		case 1: res = sweet_fp16_div(a, b); break;
++		case 2: res = sweet_fp16_add(a, b, false); break;
++		case 3: res = sweet_fp16_add(a, b, true); break;
++		case 4: res = sweet_fp16_minmax(a, b, true, false); break;
++		case 5: res = sweet_fp16_minmax(a, b, false, false); break;
++		case 6: res = sweet_fp16_minmax(a, b, true, true); break;
++		case 7: res = sweet_fp16_minmax(a, b, false, true); break;
++		case 8: res = sweet_fp16_mul(a, b, false) ^ 0x8000U; break;
++		default: return false;
++		}
++		ns->v.q[rd] = (__uint128_t)res;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 4. Scalar FP16 1-source: FMOV/FABS/FNEG/FSQRT/FRINT* Hd, Hn */
++	if ((instr & 0xFFE07C00U) == 0x1EE04000U) {
++		uint32_t opc = (instr >> 15) & 0x3FU;
++		uint16_t a = sweet_q_get_h(ns, rn, 0), res = 0;
++		uint32_t fmode = (ns->fpcr >> 22) & 3U;
++		switch (opc) {
++		case 0: res = a; break;
++		case 1: res = a & 0x7FFFU; break;
++		case 2: res = a ^ 0x8000U; break;
++		case 3: res = sweet_fp16_sqrt(a); break;
++		case 8: res = sweet_fp16_rint(a, 0); break;
++		case 9: res = sweet_fp16_rint(a, 1); break;
++		case 10: res = sweet_fp16_rint(a, 2); break;
++		case 11: res = sweet_fp16_rint(a, 3); break;
++		case 12: res = sweet_fp16_rint(a, 4); break;
++		case 14: case 15: res = sweet_fp16_rint(a, fmode); break;
++		default: return false;
++		}
++		ns->v.q[rd] = (__uint128_t)res;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 5. Scalar FP16 compare (FCMP/FCMPE), FCCMP/FCCMPE, FCSEL, FMOV #imm8 */
++	if ((instr & 0xFFE0FC07U) == 0x1EE02000U) {
++		uint16_t a = sweet_q_get_h(ns, rn, 0);
++		uint16_t b = (instr & 8U) ? 0U : sweet_q_get_h(ns, rm, 0);
++		uint32_t nzcv = sweet_fp16_cmp_nzcv(a, b);
++		set_saved_state_cpsr(state, (get_saved_state_cpsr(state) & ~0xF0000000U) | (nzcv << 28));
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if ((instr & 0xFFE00C10U) == 0x1EE00400U) {
++		uint32_t cond = (instr >> 12) & 0xFU, nzcv = instr & 0xFU;
++		uint32_t cpsr = get_saved_state_cpsr(state);
++		if (sweet_cond_holds(cond, cpsr)) {
++			nzcv = sweet_fp16_cmp_nzcv(sweet_q_get_h(ns, rn, 0), sweet_q_get_h(ns, rm, 0));
++		}
++		set_saved_state_cpsr(state, (cpsr & ~0xF0000000U) | (nzcv << 28));
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if ((instr & 0xFFE00C00U) == 0x1EE00C00U) {
++		uint32_t cond = (instr >> 12) & 0xFU;
++		uint16_t chosen = sweet_cond_holds(cond, get_saved_state_cpsr(state)) ?
++		    sweet_q_get_h(ns, rn, 0) : sweet_q_get_h(ns, rm, 0);
++		ns->v.q[rd] = (__uint128_t)chosen;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if ((instr & 0xFFE01FE0U) == 0x1EE01000U) {
++		uint32_t imm8 = (instr >> 13) & 0xFFU;
++		uint16_t sign = (uint16_t)((imm8 >> 7) << 15);
++		uint32_t b6 = (imm8 >> 6) & 1U;
++		uint16_t exp = (uint16_t)((((b6 ^ 1U) << 4) | (b6 ? 0xCU : 0U) | ((imm8 >> 4) & 3U)) << 10);
++		uint16_t frac = (uint16_t)((imm8 & 0xFU) << 6);
++		ns->v.q[rd] = (__uint128_t)(sign | exp | frac);
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 6. Scalar FP16 <-> GP register moves & integer conversions */
++	if ((instr & 0x7FE0FC00U) == 0x1EE00000U) {
++		bool is64 = (instr >> 31) != 0;
++		uint32_t rmode = (instr >> 19) & 3U, opc = (instr >> 16) & 7U;
++		if (rmode == 0 && opc == 6) { /* FMOV Wd/Xd, Hn */
++			if (rd != 31U) {
++				set_saved_state_reg(state, rd, (register_t)sweet_q_get_h(ns, rn, 0));
++			}
++		} else if (rmode == 0 && opc == 7) { /* FMOV Hd, Wn/Xn */
++			uint64_t g = rn == 31U ? 0ULL : (uint64_t)get_saved_state_reg(state, rn);
++			ns->v.q[rd] = (__uint128_t)(uint16_t)g;
++		} else if (rmode == 0 && (opc == 2 || opc == 3)) { /* SCVTF / UCVTF Hd, Wn/Xn */
++			uint64_t g = rn == 31U ? 0ULL : (uint64_t)get_saved_state_reg(state, rn);
++			__int128 v;
++			if (opc == 2) {
++				v = is64 ? (__int128)(int64_t)g : (__int128)(int32_t)(uint32_t)g;
++			} else {
++				v = is64 ? (__int128)(unsigned __int128)g : (__int128)(uint64_t)(uint32_t)g;
++			}
++			ns->v.q[rd] = (__uint128_t)sweet_s128_to_fp16(v, 0, false);
++		} else if (opc <= 1 || (rmode == 0 && (opc == 4 || opc == 5))) {
++			uint32_t eff_rmode = (opc >= 4) ? 4U : rmode;
++			bool is_u = (opc & 1U) != 0;
++			uint64_t out = sweet_fp16_to_int(sweet_q_get_h(ns, rn, 0), is_u, is64, eff_rmode);
++			if (rd != 31U) {
++				set_saved_state_reg(state, rd, (register_t)out);
++			}
++		} else {
++			return false;
++		}
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 7. ASIMDHP Vector 3-same (.4H / .8H) */
++	if ((instr & 0x9F600400U) == 0x0E400400U) {
++		uint32_t qbit = (instr >> 30) & 1U, ubit = (instr >> 29) & 1U;
++		uint32_t o2 = (instr >> 23) & 1U, opc = (instr >> 11) & 0x1FU;
++		uint32_t lanes = 4U << qbit;
++		__uint128_t out_q = 0;
++		for (uint32_t i = 0; i < lanes; i++) {
++			uint16_t a = sweet_q_get_h(ns, rn, i), b = sweet_q_get_h(ns, rm, i);
++			uint16_t c = sweet_q_get_h(ns, rd, i), r = 0;
++			if (ubit == 0 && o2 == 0 && opc == 0x19) r = sweet_fp16_fma(c, a, b, false, false);
++			else if (ubit == 0 && o2 == 1 && opc == 0x19) r = sweet_fp16_fma(c, a, b, true, false);
++			else if (ubit == 0 && o2 == 0 && opc == 0x1A) r = sweet_fp16_add(a, b, false);
++			else if (ubit == 0 && o2 == 1 && opc == 0x1A) r = sweet_fp16_add(a, b, true);
++			else if (ubit == 1 && o2 == 1 && opc == 0x1A) r = sweet_fp16_add(a, b, true) & 0x7FFFU;
++			else if (ubit == 1 && o2 == 0 && opc == 0x1B) r = sweet_fp16_mul(a, b, false);
++			else if (ubit == 0 && o2 == 0 && opc == 0x1B) r = sweet_fp16_mul(a, b, true);
++			else if (ubit == 1 && o2 == 0 && opc == 0x1F) r = sweet_fp16_div(a, b);
++			else if (ubit == 0 && o2 == 0 && opc == 0x1E) r = sweet_fp16_minmax(a, b, true, false);
++			else if (ubit == 0 && o2 == 1 && opc == 0x1E) r = sweet_fp16_minmax(a, b, false, false);
++			else if (ubit == 0 && o2 == 0 && opc == 0x18) r = sweet_fp16_minmax(a, b, true, true);
++			else if (ubit == 0 && o2 == 1 && opc == 0x18) r = sweet_fp16_minmax(a, b, false, true);
++			else if (ubit == 0 && o2 == 0 && opc == 0x1C) r = (sweet_fp16_cmp_nzcv(a, b) == 0x6U) ? 0xFFFFU : 0U;
++			else if (ubit == 1 && o2 == 0 && opc == 0x1C) { uint32_t z = sweet_fp16_cmp_nzcv(a, b); r = (z == 0x6U || z == 0x2U) ? 0xFFFFU : 0U; }
++			else if (ubit == 1 && o2 == 1 && opc == 0x1C) r = (sweet_fp16_cmp_nzcv(a, b) == 0x2U) ? 0xFFFFU : 0U;
++			else return false;
++			out_q |= (__uint128_t)r << (16U * i);
++		}
++		ns->v.q[rd] = out_q;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 8. ASIMDHP Vector by-element (.4H / .8H: FMLA, FMLS, FMUL, FMULX) */
++	if ((instr & 0x9FC00400U) == 0x0F000000U) {
++		uint32_t qbit = (instr >> 30) & 1U, ubit = (instr >> 29) & 1U;
++		uint32_t opc = (instr >> 12) & 0xFU;
++		uint32_t idx = (((instr >> 11) & 1U) << 2) | (((instr >> 21) & 1U) << 1) | ((instr >> 20) & 1U);
++		uint16_t b = sweet_q_get_h(ns, rm & 0xFU, idx);
++		uint32_t lanes = 4U << qbit;
++		__uint128_t out_q = 0;
++		for (uint32_t i = 0; i < lanes; i++) {
++			uint16_t a = sweet_q_get_h(ns, rn, i), c = sweet_q_get_h(ns, rd, i), r = 0;
++			if (ubit == 0 && opc == 1) r = sweet_fp16_fma(c, a, b, false, false);
++			else if (ubit == 0 && opc == 5) r = sweet_fp16_fma(c, a, b, true, false);
++			else if (ubit == 0 && opc == 9) r = sweet_fp16_mul(a, b, false);
++			else if (ubit == 1 && opc == 9) r = sweet_fp16_mul(a, b, true);
++			else return false;
++			out_q |= (__uint128_t)r << (16U * i);
++		}
++		ns->v.q[rd] = out_q;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	/* 9. ASIMDHP Vector 2-reg misc & Vector FMOV #imm8 (.4H / .8H) */
++	if ((instr & 0xBFF8FC00U) == 0x0F00FC00U) {
++		uint32_t qbit = (instr >> 30) & 1U;
++		uint32_t imm8 = (((instr >> 16) & 7U) << 5) | ((instr >> 5) & 0x1FU);
++		uint16_t sign = (uint16_t)((imm8 >> 7) << 15);
++		uint32_t b6 = (imm8 >> 6) & 1U;
++		uint16_t exp = (uint16_t)((((b6 ^ 1U) << 4) | (b6 ? 0xCU : 0U) | ((imm8 >> 4) & 3U)) << 10);
++		uint16_t h = sign | exp | (uint16_t)((imm8 & 0xFU) << 6);
++		__uint128_t out_q = 0;
++		for (uint32_t i = 0; i < (4U << qbit); i++) {
++			out_q |= (__uint128_t)h << (16U * i);
++		}
++		ns->v.q[rd] = out_q;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++	if ((instr & 0x9F7E0C00U) == 0x0E780800U) {
++		uint32_t qbit = (instr >> 30) & 1U, ubit = (instr >> 29) & 1U;
++		uint32_t abit = (instr >> 23) & 1U, opc = (instr >> 12) & 0x1FU;
++		uint32_t lanes = 4U << qbit;
++		__uint128_t out_q = 0;
++		for (uint32_t i = 0; i < lanes; i++) {
++			uint16_t a = sweet_q_get_h(ns, rn, i), r = 0;
++			if (ubit == 0 && abit == 1 && opc == 0x0F) r = a & 0x7FFFU;
++			else if (ubit == 1 && abit == 1 && opc == 0x0F) r = a ^ 0x8000U;
++			else if (ubit == 1 && abit == 1 && opc == 0x1F) r = sweet_fp16_sqrt(a);
++			else if (ubit == 0 && abit == 0 && opc == 0x1D) r = sweet_s128_to_fp16((__int128)(int16_t)a, 0, false);
++			else if (ubit == 1 && abit == 0 && opc == 0x1D) r = sweet_s128_to_fp16((__int128)(uint16_t)a, 0, false);
++			else if (ubit == 0 && abit == 1 && opc == 0x1B) r = (uint16_t)(int16_t)sweet_fp16_to_int(a, false, false, 3);
++			else if (ubit == 1 && abit == 1 && opc == 0x1B) r = (uint16_t)sweet_fp16_to_int(a, true, false, 3);
++			else if (ubit == 0 && abit == 0 && opc == 0x18) r = sweet_fp16_rint(a, 0);
++			else if (ubit == 0 && abit == 1 && opc == 0x18) r = sweet_fp16_rint(a, 2);
++			else if (ubit == 1 && abit == 0 && opc == 0x18) r = sweet_fp16_rint(a, 4);
++			else if (ubit == 0 && abit == 0 && opc == 0x19) r = sweet_fp16_rint(a, 1);
++			else if (ubit == 0 && abit == 1 && opc == 0x19) r = sweet_fp16_rint(a, 3);
++			else return false;
++			out_q |= (__uint128_t)r << (16U * i);
++		}
++		ns->v.q[rd] = out_q;
++		add_saved_state_pc(state, 4);
++		return true;
++	}
++
++	return false;
++}
+ #endif /* SWEET */
+ 
+ /*
+@@ -1449,7 +2094,8 @@
+ 
+ #if defined(SWEET)
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) &&
+-	    (sweet_emulate_armv83_pac(state, instr) || sweet_emulate_lse(state, instr))) {
++	    (sweet_emulate_armv83_pac(state, instr) || sweet_emulate_lse(state, instr) ||
++	    sweet_emulate_fp16_rdm(state, instr))) {
+ 		return;
+ 	}
+ #endif

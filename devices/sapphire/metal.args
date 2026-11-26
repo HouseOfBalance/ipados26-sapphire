@@ -1,0 +1,15 @@
+# Per-device Metal settings for Xiaomi Redmi Note 13 4G (sapphire / SM6225Pro / Adreno 610 v2)
+# Installed to /redwood/etc/metal.args and copied to /var/tmp/metal.args.
+#
+# - metal_defer: offload PM4 command buffer recording (~40 us/draw on Kryo 260) onto a dedicated
+#   hakios-metal worker thread so CoreAnimation's render thread never stalls on draw encoding.
+# - metal_gmem + metal_gmem_draws: Adreno 610 has 128 KiB on-chip GMEM at 0x00100000 (112 KiB
+#   color tile budget below the quarter-CCU cache, e.g. 544x48 tiles on 1080x2400 BGRA8 with
+#   hardware VSC visibility binning). Light CoreAnimation UI passes below the 56-draw threshold
+#   stay strictly in sysmem (avoiding 4x slower GMEM framebuffer-fetch overhead), while heavy
+#   full-screen blended passes (>= 56 draws) tile in GMEM (~2.4x GPU speedup); when draw-threshold
+#   filtering is disabled, per-pass GPU timestamp auto-tuning (preferGmem) selects whichever mode
+#   is faster.
+metal_defer=1
+metal_gmem=1
+metal_gmem_draws=56
