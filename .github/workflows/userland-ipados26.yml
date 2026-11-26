@@ -171,12 +171,14 @@ jobs:
           "$LDID_BIN" -S "$OUT/lib/libredwood-glload.dylib"
           cp -p "$OUT/lib/libredwood-gl.dylib" "$OUT/lib/eagl.dylib"
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib -undefined dynamic_lookup \
+          DYNFLAGS="-dynamiclib -Wl,-undefined,dynamic_lookup"
+
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS \
             -install_name /redwood/lib/inject_sb.dylib -o "$OUT/lib/inject_sb.dylib" userland/src/inject_sb.c \
             -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics -framework IOKit -lobjc -ldl -lpthread
           "$LDID_BIN" -S "$OUT/lib/inject_sb.dylib"
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/SapphireBrightness.dylib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS -install_name /redwood/lib/SapphireBrightness.dylib \
             -o "$OUT/lib/SapphireBrightness.dylib" userland/brightness/SapphireBrightness.c \
             -framework CoreFoundation -framework IOKit -lobjc -lm
           "$LDID_BIN" -S "$OUT/lib/SapphireBrightness.dylib"
@@ -203,13 +205,13 @@ jobs:
           "$LDID_BIN" -Suserland/telephony/ctdial.entitlements "$OUT/bin/ctdial"
           for b in qmitool ccstart bbstart pdpnet; do "$LDID_BIN" -Suserland/rtcd/ent.xml "$OUT/bin/$b"; done
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/ccbridge.dylib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS -install_name /redwood/lib/ccbridge.dylib \
             -o "$OUT/lib/ccbridge.dylib" userland/telephony/ccbridge.c -framework CoreFoundation -framework IOKit
-          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/libsapphire-fakebb.dylib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS -install_name /redwood/lib/libsapphire-fakebb.dylib \
             -o "$OUT/lib/libsapphire-fakebb.dylib" userland/telephony/fakebb.c -framework CoreFoundation -framework IOKit
-          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/libsapphire-bdsandbox.dylib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS -install_name /redwood/lib/libsapphire-bdsandbox.dylib \
             -o "$OUT/lib/libsapphire-bdsandbox.dylib" userland/telephony/bdsandbox.c
-          "$CLANG_BIN" $TFLAGS -dynamiclib -install_name /redwood/lib/btbridge.dylib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS -install_name /redwood/lib/btbridge.dylib \
             -o "$OUT/lib/btbridge.dylib" userland/bluetooth/btbridge.c -framework CoreFoundation -framework IOKit
           for d in ccbridge.dylib libsapphire-fakebb.dylib libsapphire-bdsandbox.dylib btbridge.dylib; do
             "$LDID_BIN" -S "$OUT/lib/$d"
@@ -266,7 +268,7 @@ jobs:
             for b in fpd fpload fpsave fpctl; do "$LDID_BIN" -S../rtcd/ent.xml "$OUT/bin/$b"; done
             cp com.sapphire.fpd.plist "$OUT/launchd/"
             for t in SapphireFingerprint SapphireFingerprintSettings SapphireBiometry; do
-              "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib -install_name "/var/jb/usr/lib/TweakInject/$t.dylib" \
+              "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS -install_name "/var/jb/usr/lib/TweakInject/$t.dylib" \
                 -lobjc -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
                 -o "$OUT/tweaks/$t.dylib" "$t.m"
               "$LDID_BIN" -S "$OUT/tweaks/$t.dylib"
@@ -282,58 +284,58 @@ jobs:
           )
 
           # 7. ElleKit Tweaks compatible with iPadOS 26.1 (arm64e)
-          "$CLANG_BIN" $TFLAGS -dynamiclib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireHaptics.dylib \
             -framework Foundation -framework UIKit -framework AudioToolbox -ldl \
             -o "$OUT/tweaks/SapphireHaptics.dylib" userland/haptics/SapphireHaptics.m
           cp userland/haptics/SapphireHaptics.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireBTCapability.dylib \
             -lobjc -framework Foundation -framework IOKit \
             -o "$OUT/tweaks/SapphireBTCapability.dylib" userland/tweaks/btcapability/SapphireBTCapability.m
           cp userland/tweaks/btcapability/SapphireBTCapability.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireNoCamera.dylib \
             -framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
             -framework IOSurface -framework QuartzCore -framework AVFoundation -lobjc \
             -o "$OUT/tweaks/SapphireNoCamera.dylib" userland/tweaks/nocamera/SapphireNoCamera.c
           cp userland/tweaks/nocamera/SapphireNoCamera.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireFigShim.dylib \
             -framework CoreFoundation -framework IOSurface -lobjc \
             -o "$OUT/tweaks/SapphireFigShim.dylib" userland/tweaks/figshim/SapphireFigShim.c
           cp userland/tweaks/figshim/SapphireFigShim.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireAVCamera.dylib \
             -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
             -framework Foundation -framework IOSurface -framework QuartzCore -framework UIKit -framework Vision -lobjc \
             -o "$OUT/tweaks/SapphireAVCamera.dylib" userland/tweaks/avcamera/SapphireAVCamera.m
           cp userland/tweaks/avcamera/SapphireAVCamera.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireFaceID.dylib \
             -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore -lobjc \
             -o "$OUT/tweaks/SapphireFaceID.dylib" userland/faceid/SapphireFaceID.m
           cp userland/faceid/SapphireFaceID.plist "$OUT/tweaks/"
 
           # 120Hz CADisplayLink promotion, Vol+/Vol- mute switch, Safari container fix & software HEIF decoder
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireDisplayLink.dylib \
             -framework Foundation -framework QuartzCore -lobjc \
             -o "$OUT/tweaks/SapphireDisplayLink.dylib" userland/tweaks/displaylink/SapphireDisplayLink.m
           cp userland/tweaks/displaylink/SapphireDisplayLink.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -dynamiclib \
+          "$CLANG_BIN" $TFLAGS $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireButtonRegenerator.dylib \
             -framework Foundation -lobjc \
             -o "$OUT/tweaks/SapphireButtonRegenerator.dylib" userland/tweaks/buttonregenerator/SapphireButtonRegenerator.m
           cp userland/tweaks/buttonregenerator/SapphireButtonRegenerator.plist "$OUT/tweaks/"
 
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireSafari.dylib \
             -framework Foundation -lobjc \
             -o "$OUT/tweaks/SapphireSafari.dylib" userland/tweaks/safari/SapphireSafari.m
@@ -342,7 +344,7 @@ jobs:
           if [ ! -f userland/heif/prefix-arm64e/lib/libheif.a ]; then
             ARCH=arm64e SDK="$SDK_PATH" CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" bash userland/heif/build-libs.sh
           fi
-          "$CLANG_BIN" $TFLAGS -fobjc-arc -dynamiclib \
+          "$CLANG_BIN" $TFLAGS -fobjc-arc $DYNFLAGS \
             -install_name /var/jb/usr/lib/TweakInject/SapphireHEIF.dylib \
             -Iuserland/heif/prefix-arm64e/include -DLIBHEIF_STATIC_BUILD \
             -framework Foundation -framework ImageIO -framework CoreGraphics -lobjc \
