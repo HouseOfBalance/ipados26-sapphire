@@ -66,7 +66,7 @@ pkg-config = 'false'
 system = 'darwin'
 subsystem = 'ios'
 cpu_family = 'aarch64'
-cpu = '$ARCH'
+cpu = 'aarch64'
 endian = 'little'
 
 [built-in options]
@@ -79,15 +79,17 @@ needs_exe_wrapper = true
 INI
 DRIVERS=${DRIVERS:-softpipe,freedreno}
 BUILD=build-${ARCH}-${DRIVERS//,/-}
-[ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file cross-${ARCH}.ini --wrap-mode=nofallback \
-	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
-	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
-	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
-	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
-	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
-	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
-ninja -C $BUILD > ninja.log
-ninja -C $BUILD src/compiler/air/libair.a >> ninja.log
+if [ ! -f $BUILD/build.ninja ]; then
+	meson setup $BUILD mesa-$VERSION --cross-file cross-${ARCH}.ini --wrap-mode=nofallback \
+		--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+		-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+		-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
+		-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
+		-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
+		-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log 2>&1 || { cat meson-setup.log >&2; cat $BUILD/meson-logs/meson-log.txt >&2 || true; exit 1; }
+fi
+ninja -C $BUILD > ninja.log 2>&1 || { tail -n 120 ninja.log >&2; exit 1; }
+ninja -C $BUILD src/compiler/air/libair.a >> ninja.log 2>&1 || { tail -n 120 ninja.log >&2; exit 1; }
 "$STRIP_BIN" -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
 "$INTOOL_BIN" -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
 if [ "$ARCH" = "arm64e" ] && [ -f "$HERE/../tools/ipados26_depac.py" ]; then

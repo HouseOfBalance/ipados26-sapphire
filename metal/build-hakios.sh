@@ -96,7 +96,7 @@ HM_SRCS=(
 echo "[HakiosMetal] Compiling hakios-metal C++17 core ($ARCH)..."
 for s in "${HM_SRCS[@]}"; do
 	# shellcheck disable=SC2086
-	"$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" \
+	"$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" ${EXTRA_FLAGS:-} \
 		-std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
 		-DHAKIOS_METAL_MESA -DHAKIOS_METAL_CACHE_BUILD="\"$CACHE_BUILD\"" \
 		$MESA_DEFS "${MESA_INC[@]}" \
@@ -111,7 +111,8 @@ else
 fi
 
 echo "[HakiosMetal] Compiling HakiosMetalCA.m ($ARCH, non-ARC)..."
-"$CLANG_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" \
+# shellcheck disable=SC2086
+"$CLANG_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" ${EXTRA_FLAGS:-} \
 	-O2 -Wall -Wno-deprecated-declarations -Wno-unused-parameter -Wno-unused-function \
 	-DHAKIOS_METAL_GPU -I"$REPO/hakios-metal/include" \
 	-c "$REPO/userland/src/HakiosMetalCA.m" -o "$WORK/HakiosMetalCA.o"
@@ -149,7 +150,8 @@ PLIST
 
 echo "[HakiosMetal] Linking HakiosMetal.bundle..."
 # Put metal/tbd after SDK frameworks so private _MTL* class stubs resolve cleanly even on public SDKs
-"$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" $LD_EXTRA \
+# shellcheck disable=SC2086
+"$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" ${EXTRA_FLAGS:-} $LD_EXTRA \
 	-bundle -o "$BUNDLE/HakiosMetal" \
 	"$WORK/HakiosMetalCA.o" "$WORK/libhakios-metal.a" "${MESA_ARCHIVES[@]}" \
 	-L"$HERE/tbd" -lMetal \

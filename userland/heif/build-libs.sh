@@ -69,8 +69,8 @@ tar -C "$B/src" -xf "$HEIF_TAR"
 cmake -S "$B/src/libde265-1.0.15" -B "$B/de265" -G Ninja \
 	-DCMAKE_TOOLCHAIN_FILE="$TC" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_INSTALL_PREFIX="$P" -DBUILD_SHARED_LIBS=OFF -DENABLE_SDL=OFF -DENABLE_DECODER=OFF -DENABLE_ENCODER=OFF \
-	-DCMAKE_POSITION_INDEPENDENT_CODE=ON > "$B/de265.log" 2>&1
-ninja -C "$B/de265" install >> "$B/de265.log" 2>&1
+	-DCMAKE_POSITION_INDEPENDENT_CODE=ON > "$B/de265.log" 2>&1 || { cat "$B/de265.log" >&2; exit 1; }
+ninja -C "$B/de265" install >> "$B/de265.log" 2>&1 || { tail -n 80 "$B/de265.log" >&2; exit 1; }
 
 cmake -S "$B/src/libheif-1.18.2" -B "$B/heif" -G Ninja \
 	-DCMAKE_TOOLCHAIN_FILE="$TC" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
@@ -80,8 +80,8 @@ cmake -S "$B/src/libheif-1.18.2" -B "$B/heif" -G Ninja \
 	-DWITH_KVAZAAR=OFF -DWITH_UVG266=OFF -DWITH_VVDEC=OFF -DWITH_VVENC=OFF -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF \
 	-DWITH_LIBSHARPYUV=OFF -DENABLE_PLUGIN_LOADING=OFF -DBUILD_TESTING=OFF -DWITH_UNCOMPRESSED_CODEC=OFF \
 	-DCMAKE_POSITION_INDEPENDENT_CODE=ON -DLIBDE265_INCLUDE_DIR="$P/include" -DLIBDE265_LIBRARY="$P/lib/libde265.a" \
-	> "$B/heif.log" 2>&1
-ninja -C "$B/heif" install >> "$B/heif.log" 2>&1
+	> "$B/heif.log" 2>&1 || { cat "$B/heif.log" >&2; exit 1; }
+ninja -C "$B/heif" install >> "$B/heif.log" 2>&1 || { tail -n 80 "$B/heif.log" >&2; exit 1; }
 
 # Keep compatibility symlink at $TOP/prefix when building default
 if [[ "$P" != "$TOP/prefix" && ! -e "$TOP/prefix" ]]; then

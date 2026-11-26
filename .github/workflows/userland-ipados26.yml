@@ -115,14 +115,37 @@ jobs:
       - name: Build Sapphire arm64e Userland + HakiosMetal + Audio + Tweaks + Apps (iPadOS 26.1)
         run: |
           set -e
-          # Use iPhoneOS16.5.sdk from theos-sdks for private framework TBDs (IOSurface, MediaToolbox, CoreTelephony)
-          # while compiling all slices as -target arm64e-apple-ios16.0 so iPadOS 26.1 arm64e processes load them!
-          SDK_PATH="$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk"
-          if [ ! -d "$SDK_PATH" ]; then
-            SDK_PATH=$(find "$HOME/sdks/theos-sdks" -maxdepth 1 -name "iPhoneOS*.sdk" | sort -V | tail -1)
+          # Use Xcode's iPhoneOS SDK as primary sysroot (matches Xcode clang/libc++ headers) and pass theos-sdks
+          # as fallback framework/TBD search paths ONLY for private frameworks (CoreTelephony, MediaToolbox, etc.).
+          THEOS_SDK="$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk"
+          if [ ! -d "$THEOS_SDK" ]; then
+            THEOS_SDK=$(find "$HOME/sdks/theos-sdks" -maxdepth 1 -name "iPhoneOS*.sdk" | sort -V | tail -1)
           fi
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Private SDK: $SDK_PATH | Xcode SDK: $XCODE_SDK"
+          SDK_PATH="$XCODE_SDK"
+          # Copy any private headers/frameworks from theos-sdks that are absent in Xcode's public iPhoneOS SDK
+          # into a local overlay directory so Xcode's matching libc++/System headers & TBDs remain primary!
+          PRIV_OVERLAY="$HOME/sdks/priv-overlay"
+          rm -rf "$PRIV_OVERLAY"
+          mkdir -p "$PRIV_OVERLAY/Frameworks" "$PRIV_OVERLAY/PrivateFrameworks" "$PRIV_OVERLAY/include"
+          for fw in "$THEOS_SDK"/System/Library/Frameworks/*.framework; do
+            fwname=$(basename "$fw")
+            if [ ! -d "$XCODE_SDK/System/Library/Frameworks/$fwname" ]; then
+              ln -s "$fw" "$PRIV_OVERLAY/Frameworks/$fwname"
+            fi
+          done
+          for pfw in "$THEOS_SDK"/System/Library/PrivateFrameworks/*.framework; do
+            [ -e "$pfw" ] || continue
+            ln -s "$pfw" "$PRIV_OVERLAY/PrivateFrameworks/$(basename "$pfw")"
+          done
+          if [ -d "$THEOS_SDK/System/Library/Frameworks/IOKit.framework/Headers" ]; then
+            rm -rf "$PRIV_OVERLAY/Frameworks/IOKit.framework"
+            mkdir -p "$PRIV_OVERLAY/Frameworks/IOKit.framework"
+            cp -R "$XCODE_SDK/System/Library/Frameworks/IOKit.framework/." "$PRIV_OVERLAY/Frameworks/IOKit.framework/" 2>/dev/null || true
+            cp -Rn "$THEOS_SDK/System/Library/Frameworks/IOKit.framework/Headers" "$PRIV_OVERLAY/Frameworks/IOKit.framework/" 2>/dev/null || true
+          fi
+          PRIV_FLAGS="-F$PRIV_OVERLAY/Frameworks -F$PRIV_OVERLAY/PrivateFrameworks -idirafter $THEOS_SDK/usr/include"
+          echo "Xcode SDK: $XCODE_SDK | Private fallback SDK: $THEOS_SDK"
           CLANG_BIN="$(xcrun -find clang)"
           CLANGXX_BIN="$(xcrun -find clang++)"
           LDID_BIN="/usr/local/bin/ldid"
@@ -130,20 +153,20 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/tweaks" "$OUT/launchd" "$OUT/apps" "$OUT/bundles" "$OUT/etc"
 
-          TFLAGS="-target arm64e-apple-ios16.0 -isysroot $SDK_PATH -O2 -Wall -Wno-deprecated-declarations -Wno-unused-parameter"
+          TFLAGS="-target arm64e-apple-ios16.0 -isysroot $SDK_PATH $PRIV_FLAGS -O2 -Wall -Wno-deprecated-declarations -Wno-unused-parameter"
 
           # Stage per-device Adreno 610 Metal configuration
           cp devices/sapphire/metal.args "$OUT/etc/metal.args"
 
           # 1. Mesa (libOSMesa.8.dylib + libair.a) + HakiosMetal.bundle (real Adreno 610 GPU Metal) + SapphireMetal.bundle
           ARCH=arm64e CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" SDK="$SDK_PATH" B="$HOME/mesa-ios-26" bash userland/mk-mesa.sh
-          ARCH=arm64e CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" SDK="$SDK_PATH" MESA_ROOT="$HOME/mesa-ios-26" bash metal/build-hakios.sh "$OUT/bundles"
+          ARCH=arm64e CLANG="$CLANG_BIN" CLANGXX="$CLANGXX_BIN" SDK="$SDK_PATH" EXTRA_FLAGS="$PRIV_FLAGS" MESA_ROOT="$HOME/mesa-ios-26" bash metal/build-hakios.sh "$OUT/bundles"
           ARCH=arm64e CLANG="$CLANG_BIN" sh metal/build.sh "$OUT/bundles"
 
           # 2. EAGL bridge (libredwood-gl.dylib for OpenGLES apps) + system injected bridges (/redwood/lib/*)
           cp "$HOME/mesa-ios-26/out/libOSMesa.8.dylib" "$OUT/lib/libOSMesa.8.dylib"
           "$LDID_BIN" -S "$OUT/lib/libOSMesa.8.dylib"
-          ARCH=arm64e CLANG="$CLANG_BIN" SDK="$SDK_PATH" M="$HOME/mesa-ios-26/out" OUT="$OUT/lib" bash userland/build-gl.sh
+          ARCH=arm64e CLANG="$CLANG_BIN" SDK="$SDK_PATH" EXTRA_FLAGS="$PRIV_FLAGS" M="$HOME/mesa-ios-26/out" OUT="$OUT/lib" bash userland/build-gl.sh
           "$LDID_BIN" -S "$OUT/lib/libredwood-gl.dylib"
           "$LDID_BIN" -S "$OUT/lib/libredwood-glload.dylib"
           cp -p "$OUT/lib/libredwood-gl.dylib" "$OUT/lib/eagl.dylib"
