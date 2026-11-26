@@ -37,7 +37,7 @@ else
 	LINK_ARGS="['-fuse-ld=lld']"
 fi
 mkdir -p "$B/out" && cd "$B"
-PATCHES=$(cat "$HERE"/mesa/*.patch | (shasum -a 256 2>/dev/null || sha256sum) | awk '{print $1}')
+PATCHES=$(cat "$HERE/mk-mesa.sh" "$HERE"/mesa/*.patch | (shasum -a 256 2>/dev/null || sha256sum) | awk '{print $1}')
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.sapphire-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | (shasum -a 256 -c >/dev/null 2>&1 || sha256sum -c >/dev/null)
@@ -54,7 +54,7 @@ if [ ! -x venv/bin/python3 ]; then
 	venv/bin/pip -q install mako pyyaml packaging
 fi
 export PATH=$B/venv/bin:$PATH
-T="'-target', '${ARCH}-apple-ios${IOS_VER}', '-isysroot', '$SDK'"
+T="'-target', '${ARCH}-apple-ios${IOS_VER}', '-isysroot', '$SDK', '-D_DARWIN_C_SOURCE', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0'"
 cat > cross-${ARCH}.ini <<INI
 [binaries]
 c = ['$CLANG_BIN', $T]

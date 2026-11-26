@@ -98,6 +98,7 @@ for s in "${HM_SRCS[@]}"; do
 	# shellcheck disable=SC2086
 	"$CLANGXX_BIN" -target "${ARCH}-apple-ios${IOS_VER}" -isysroot "$SDK" ${EXTRA_FLAGS:-} \
 		-std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
+		-D_DARWIN_C_SOURCE -DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0 \
 		-DHAKIOS_METAL_MESA -DHAKIOS_METAL_CACHE_BUILD="\"$CACHE_BUILD\"" \
 		$MESA_DEFS "${MESA_INC[@]}" \
 		-I"$REPO/hakios-metal/include" \
