@@ -1452,8 +1452,9 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       }
       bool is_f = air_type_is_float(air_type_scalar(in->operands[1]->type));
       nir_def *first = lane_move_vec(c, a0, nir_imm_int(&c->b, 0), AIR_MOVE_QUAD_BRCST);
-      nir_def *same = is_f ? nir_ball_fequal(&c->b, a0, first)
-                           : nir_ball_iequal(&c->b, a0, first);
+      nir_def *cmp = is_f ? nir_feq(&c->b, a0, first)
+                          : nir_ieq(&c->b, a0, first);
+      nir_def *same = nir_ball(&c->b, cmp);
       nir_def *u = nir_b2i32(&c->b, same);
       u = nir_iand(&c->b, u, nir_quad_swap_horizontal(&c->b, u));
       u = nir_iand(&c->b, u, nir_quad_swap_vertical(&c->b, u));
