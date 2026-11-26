@@ -1,0 +1,174 @@
+diff --git a/bsd/dev/sweet_slot.h b/bsd/dev/sweet_slot.h
+index 1b51a8e..3b9170e 100644
+--- a/bsd/dev/sweet_slot.h
++++ b/bsd/dev/sweet_slot.h
+@@ -5,6 +5,7 @@
+ #ifdef KERNEL
+ #include <sys/types.h>
+ #include <stdbool.h>
++#include <stdint.h>
+ #else
+ #include <stdbool.h>
+ #include <stddef.h>
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b584236..109a34a 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -495,6 +495,7 @@ static unsigned touch_rate_new, touch_rate_reads, touch_irq_reads, touch_late_re
+  * sweettouchfast=0: the fixed 4 ms grid as before.
+  */
+ static unsigned touch_fast = 1;
++static unsigned touch_short_read = 1;
+ 
+ /* kern.sweet_touch_rate: new frames per second of contact since the last write of 0 (0312) */
+ static int
+@@ -797,7 +798,7 @@ touch_focaltech(void)
+ 	 * Fast 21-byte I2C read (3-byte header + 3 contact slots = 0.51 ms vs 1.50 ms at 400 kHz)
+ 	 * whenever <= 2 fingers were active; if TD_STATUS reports 3..10 contacts, read the rest.
+ 	 */
+-	if ((st.active & ~3u) == 0) {
++	if (touch_short_read && (st.active & ~3u) == 0) {
+ 		err = touch_read(0x38, 0, false, buf, 21);
+ 		if (err) {
+ 			return err;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ae5a1cb..4a3176c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -35,6 +35,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 35be399..71991cb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -22,6 +22,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4141f6e..ceb1ed1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -224,6 +224,7 @@ SweetLowBuf::alloc(size_t len)
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
++public:
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
+@@ -232,8 +233,6 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	void publishModes(void);
+ 	uint64_t            fNextVsync;     /* 0201: the next vsync, on an absolute 60.000 Hz grid */
+ 	void armVsync(IOTimerEventSource *t);
+-
+-public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 68801b8..61ba996 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -918,7 +918,6 @@ cpu_start(int cpu)
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
+-		CleanPoC_DcacheRegion_Force((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
+ 		__builtin_arm_dsb(DSB_SY);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 93c9d8b..1e28be5 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -4415,9 +4415,9 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+-		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+-		INTERRUPT_MASKED_DEBUG_END();
++		ml_interrupt_masked_debug_end();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 601b953..968c478 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -966,6 +966,8 @@ exception_triage(
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
++#include <vm/vm_shared_region_xnu.h>
++#include <vm/vm_map_internal.h>
+ #include <arm/thread.h>
+ 
+ /*
+diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
+index f0af7d2..0a0702f 100644
+--- a/osfmk/prng/entropy.c
++++ b/osfmk/prng/entropy.c
+@@ -473,38 +473,6 @@ entropy_health_test(uint32_t sample_count, entropy_sample_t *samples, __assert_o
+ 	return result;
+ }
+ 
+-/* SWEET uses the same built-in digest as early_random, without a kext. */
+-static void
+-entropy_hash_init(void)
+-{
+-#if defined(SWEET)
+-	ccdigest_init(&ccsha256_ltc_di, entropy_data.sha256_ctx);
+-#else
+-	SHA256_Init(&entropy_data.sha256_ctx);
+-#endif
+-}
+-
+-static void
+-entropy_hash_update(const void *data, size_t nbytes)
+-{
+-#if defined(SWEET)
+-	ccdigest_update(&ccsha256_ltc_di, entropy_data.sha256_ctx, nbytes, data);
+-#else
+-	SHA256_Update(&entropy_data.sha256_ctx, data, nbytes);
+-#endif
+-}
+-
+-static void
+-entropy_hash_final(void *out)
+-{
+-#if defined(SWEET)
+-	ccdigest_final(&ccsha256_ltc_di, entropy_data.sha256_ctx, out);
+-	ccdigest_ctx_clear(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, entropy_data.sha256_ctx);
+-#else
+-	SHA256_Final(out, &entropy_data.sha256_ctx);
+-#endif
+-}
+-
+ int32_t
+ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
+ {
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index f76d5c8..fceb607 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -32,6 +32,7 @@
+ 
+ #include <stdbool.h>
+ #include <sys/cdefs.h>
++#include <pexpert/arm64/apple_arm64_regs.h>
+ 
+ /**
+  * Defines the core type of the executing CPU.

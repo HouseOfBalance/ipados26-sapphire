@@ -594,8 +594,11 @@ dump_stacks(const char *why)
 			continue;
 		}
 		char line[400];
-		int o = snprintf(line, sizeof(line), "T%u pc %llx lr %llx:", i, st.__pc - slide, st.__lr - slide);
-		uint64_t fp = st.__fp;
+		uint64_t pc = (uint64_t)arm_thread_state64_get_pc(st);
+		uint64_t lr = (uint64_t)arm_thread_state64_get_lr(st);
+		int o = snprintf(line, sizeof(line), "T%u pc %llx lr %llx:", i,
+		    (unsigned long long)(pc - slide), (unsigned long long)(lr - slide));
+		uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
 		for (int k = 0; k < 14 && fp && (fp & 7) == 0 && o < (int)sizeof(line) - 20; k++) {
 			uint64_t *f = (uint64_t *)fp;
 			uint64_t ret = f[1];
