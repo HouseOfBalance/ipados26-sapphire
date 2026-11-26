@@ -13,6 +13,9 @@ B=${B:-$HOME/mesa-ios}
 ARCH=${ARCH:-arm64}
 IOS_VER=${IOS_VER:-16.0}
 if [ "$(uname -s)" = "Darwin" ]; then
+	for bp in /opt/homebrew/opt/bison/bin /usr/local/opt/bison/bin /opt/homebrew/opt/flex/bin /usr/local/opt/flex/bin; do
+		[ -d "$bp" ] && export PATH="$bp:$PATH"
+	done
 	CLANG_BIN=${CLANG:-$(xcrun -find clang)}
 	CLANGXX_BIN=${CLANGXX:-$(xcrun -find clang++)}
 	AR_BIN=${AR:-$(xcrun -find ar)}

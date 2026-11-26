@@ -77,7 +77,7 @@ jobs:
           sudo xcode-select -s "$DEV_DIR"
           xcodebuild -version
           xcrun clang --version
-          brew install cmake meson ninja
+          brew install cmake meson ninja bison flex
           sudo mkdir -p /usr/local/bin
           cat <<'EOF' | sudo tee /usr/local/bin/ldid >/dev/null
           #!/bin/sh

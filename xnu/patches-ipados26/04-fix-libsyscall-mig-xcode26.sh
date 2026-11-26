@@ -17,6 +17,6 @@ if p.is_file():
         'MIG=${MIG_FB:-$(xcrun -sdk "$SDKROOT" -find mig)}'
     )
     s = s.replace(old_mig, new_mig)
-    p.write_text(s, encoding="utf-8", newline="\n")
+    p.write_bytes(s.encode("utf-8"))
     print("Patched libsyscall/xcodescripts/mach_install_mig.sh for Xcode 26.1+ (armv7k + fakeroot mig)")
 PY
