@@ -203,6 +203,19 @@ index 601b953..968c478 100644
  #include <arm/thread.h>
  
  /*
+diff --git a/osfmk/kern/exclaves.c b/osfmk/kern/exclaves.c
+index c244b1b..41d2b05 100644
+--- a/osfmk/kern/exclaves.c
++++ b/osfmk/kern/exclaves.c
+@@ -2820,7 +2820,7 @@ STARTUP(TUNABLES, STARTUP_RANK_MIDDLE, exclaves_requirement_startup);
+ 
+ #endif /* CONFIG_EXCLAVES */
+ 
+-#if __has_include(<Tightbeam/tightbeam.h>)
++#if __has_include(<Tightbeam/tightbeam.h>) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <Tightbeam/tightbeam.h>
+ 
 diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
 index f0af7d2..0a0702f 100644
 --- a/osfmk/prng/entropy.c
