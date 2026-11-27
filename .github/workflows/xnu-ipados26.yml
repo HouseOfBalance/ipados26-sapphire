@@ -139,13 +139,25 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
           ccache -z
-          TOPAZ_4K="${TOPAZ_4K}" bash build.sh
+          set -o pipefail
+          # Full log is ~1 GB of -Weverything warnings; keep it out of the console.
+          TOPAZ_4K="${TOPAZ_4K}" bash build.sh > "$GITHUB_WORKSPACE/build-full.log" 2>&1
+          rc=$?
+          tail -n 40 "$GITHUB_WORKSPACE/build-full.log"
           ccache -s
+          exit $rc
+        shell: bash {0}
 
       - name: Collect kernel artifact
         if: always()
         run: |
           mkdir -p out-26
+          if [ -f build-full.log ]; then
+            grep -nE ' error: |Undefined symbols|^ld: |^  "_|\*\*\* \[|fatal error' build-full.log \
+              | grep -v 'warning:' | head -n 400 > out-26/build-errors.txt || true
+            tail -n 300 build-full.log > out-26/build-tail.txt
+            echo "=== build errors ==="; head -n 120 out-26/build-errors.txt
+          fi
           cp -R dxb/fakeroot/System/Library/Kernels/. out-26/ 2>/dev/null || true
           ls -lh out-26
           (cd out-26 && shasum -a 256 kernel.* > SHA256SUMS) || true
