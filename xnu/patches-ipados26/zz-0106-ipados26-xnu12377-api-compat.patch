@@ -916,23 +916,6 @@ index 67a2414..aee3ee3 100644
  					error = EPERM;
  					KAUTH_DEBUG("  DENIED - user attempt to set illegal flag(s)");
  					goto out;
-diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index 2bcf575..bd3df2c 100644
---- a/bsd/vfs/vfs_syscalls.c
-+++ b/bsd/vfs/vfs_syscalls.c
-@@ -1232,8 +1232,12 @@ mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
- 		 */
- 		if ((mp->mnt_flag & MNT_CPROTECT) &&
- 		    ((flags & MNT_CPROTECT) == 0)) {
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+			flags |= MNT_CPROTECT;
-+#else
- 			error = EINVAL;
- 			goto out1;
-+#endif
- 		}
- 
- 		/*
 diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
 index c7b3a77..ca63728 100644
 --- a/iokit/Kernel/IOCPU.cpp
@@ -1049,10 +1032,18 @@ index 4141f6e..854be90 100644
  static int
  sweet_fb_hz_sysctl SYSCTL_HANDLER_ARGS
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index a46c3e2..b8dece8 100644
+index a46c3e2..c467da9 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -42,7 +42,7 @@ sweet_psci_call(uint64_t fn)
+@@ -30,6 +30,7 @@ public:
+  */
+ extern "C" int sweet_spmi_set_reboot_reason(unsigned mode);
+ extern "C" int sweet_reboot_mode_get(void);
++extern "C" void sweet_log_panic_flush(void);
+ 
+ static void
+ sweet_psci_call(uint64_t fn)
+@@ -42,11 +43,14 @@ sweet_psci_call(uint64_t fn)
  int
  SweetPlatformExpert::haltRestart(unsigned int type)
  {
@@ -1061,7 +1052,14 @@ index a46c3e2..b8dece8 100644
  		int mode = sweet_reboot_mode_get();
  		int rc = sweet_spmi_set_reboot_reason((unsigned)mode);
  		IOLog("SWEET: restart, mode %d (%s), reason write %d\n", mode,
-@@ -68,8 +68,9 @@ SweetPlatformExpert::start(IOService *provider)
+ 		    mode == 2 ? "bootloader" : mode == 1 ? "recovery" : "system", rc);
++		if (type == kPERestartCPU) {
++			sweet_log_panic_flush();
++		}
+ 		IODelay(20000);
+ 		sweet_psci_call(0x84000009ULL);         /* PSCI SYSTEM_RESET */
+ 	} else if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU) {
+@@ -68,8 +72,9 @@ SweetPlatformExpert::start(IOService *provider)
  	if (!IODTPlatformExpert::start(provider)) {
  		return false;
  	}

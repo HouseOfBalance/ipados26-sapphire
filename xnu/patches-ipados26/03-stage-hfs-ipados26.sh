@@ -151,29 +151,6 @@ if old_getattr_cp not in vn or old_setattr_cp not in vn:
 vn = vn.replace(old_getattr_cp, new_getattr_cp, 1).replace(old_setattr_cp, new_setattr_cp, 1)
 vnops_path.write_text(vn)
 
-vt = vfsutils.read_text()
-old_mnt_cp = (
-    '#else\n'
-    '\t\t/* If CONFIG_PROTECT not built, ignore CP */\n'
-    '\t\tvfs_clearflags(hfsmp->hfs_mp, MNT_CPROTECT);\t\n'
-    '#endif'
-)
-new_mnt_cp = (
-    '#elif defined(ARM64_BOARD_CONFIG_SWEET)\n'
-    '\t\tvfs_setflags(hfsmp->hfs_mp, MNT_CPROTECT);\n'
-    '#else\n'
-    '\t\t/* If CONFIG_PROTECT not built, ignore CP */\n'
-    '\t\tvfs_clearflags(hfsmp->hfs_mp, MNT_CPROTECT);\t\n'
-    '#endif\n'
-    '\t} else {\n'
-    '#if defined(ARM64_BOARD_CONFIG_SWEET) && !CONFIG_PROTECT\n'
-    '\t\tvfs_setflags(hfsmp->hfs_mp, MNT_CPROTECT);\n'
-    '#endif'
-)
-if old_mnt_cp not in vt:
-    raise SystemExit(f'HFS MNT_CPROTECT block not found in {vfsutils}')
-vfsutils.write_text(vt.replace(old_mnt_cp, new_mnt_cp, 1))
-
 vfsops_path = target / 'core' / 'hfs_vfsops.c'
 vo = vfsops_path.read_text()
 old_vo1 = '#if CONFIG_PROTECT\n        \tattrp->validattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;\n#endif // CONFIG_PROTECT'
