@@ -488,28 +488,20 @@ class TestDepacRewriterAndCodeSignature(unittest.TestCase):
     """P2-15.1: Verify ipados26_depac.py instruction rewrites, section safety, and SHA-256 rehashing."""
 
     def test_tbi_safe_xpacd_and_xpaci_bitmask_encodings(self):
-        # XPACI X0 -> AND X0, X0, #0x0000ffffffffffff (0x9240BC00)
+        # XPACI X0 -> NOP (0xD503201F)
         xpaci_x0, xpaci_kind = ipados26_depac.rewrite_arm64e_insn(0xDAC143E0)
         self.assertEqual(xpaci_kind, 'xpaci')
-        self.assertEqual(xpaci_x0, 0x9240BC00)
-        n0 = (xpaci_x0 >> 22) & 1
-        immr0 = (xpaci_x0 >> 16) & 0x3F
-        imms0 = (xpaci_x0 >> 10) & 0x3F
-        self.assertEqual(decode_arm64_bitmask_imm64(n0, imms0, immr0), 0x0000FFFFFFFFFFFF)
+        self.assertEqual(xpaci_x0, 0xD503201F)
 
-        # XPACD X1 -> AND X1, X1, #0xff00ffffffffffff (N=1, immr=8, imms=55 -> 0x9248DC21)
-        # Must preserve Darwin TBI top byte [63:56] while stripping PAC [55:48]!
+        # XPACD X1 -> NOP (0xD503201F): preserves Darwin TBI [63:56] AND negative
+        # sentinel pointers (-1, -2 = 0xfffffffffffffffe in libdispatch)!
         xpacd_x1, xpacd_kind = ipados26_depac.rewrite_arm64e_insn(0xDAC147E1)
         self.assertEqual(xpacd_kind, 'xpacd')
-        self.assertEqual(xpacd_x1, 0x9248DC21)
-        n1 = (xpacd_x1 >> 22) & 1
-        immr1 = (xpacd_x1 >> 16) & 0x3F
-        imms1 = (xpacd_x1 >> 10) & 0x3F
-        mask1 = decode_arm64_bitmask_imm64(n1, imms1, immr1)
-        self.assertEqual(mask1, 0xFF00FFFFFFFFFFFF)
-        # Simulate applying mask to a TBI-tagged + PAC-signed ObjC pointer:
-        sample_ptr = 0xB5_7F_0001_2345_6780
-        self.assertEqual(sample_ptr & mask1, 0xB5_00_0001_2345_6780)
+        self.assertEqual(xpacd_x1, 0xD503201F)
+
+        xpaclri, xpaclri_kind = ipados26_depac.rewrite_arm64e_insn(0xD50320FF)
+        self.assertEqual(xpaclri_kind, 'xpaclri')
+        self.assertEqual(xpaclri, 0xD503201F)
 
     def test_synthetic_macho_rewrite_cs_rehash_and_audit_cli(self):
         # Pairs of (arm64e_input_insn, expected_armv80_insn)
@@ -522,9 +514,9 @@ class TestDepacRewriterAndCodeSignature(unittest.TestCase):
             (0xD50323BF, 0xD50323BF),                          # AUTIASP (HINT #29, hw NOP on v8.0)
             (0xDAC10020, 0xD503201F),                          # PACIA X0, X1 -> NOP
             (0xDAC11462, 0xD503201F),                          # AUTIB X2, X3 -> NOP
-            (0xDAC143E0, 0x9240BC00),                          # XPACI X0 -> AND X0, X0, #0x0000ffffffffffff
-            (0xDAC147E1, 0x9248DC21),                          # XPACD X1 -> AND X1, X1, #0xff00ffffffffffff
-            (0xD50320FF, 0x9240BFDE),                          # XPACLRI -> AND X30, X30, #0x0000ffffffffffff
+            (0xDAC143E0, 0xD503201F),                          # XPACI X0 -> NOP
+            (0xDAC147E1, 0xD503201F),                          # XPACD X1 -> NOP
+            (0xD50320FF, 0xD503201F),                          # XPACLRI -> NOP
             (0xF8BFC000 | (3 << 5) | 2, 0xC8DFFC00 | (3 << 5) | 2),  # LDAPR X2, [X3] -> LDAR X2, [X3]
             (0xD50B7C24, 0xD50B7A24),                          # DC CVAP, X4 -> DC CVAC, X4
             (0xD50330FF, 0xD5033FDF),                          # SB -> ISB (ARMv8.5 barrier)
@@ -673,7 +665,7 @@ class TestDepacRewriterAndCodeSignature(unittest.TestCase):
             ipa_src = f.read()
         self.assertIn('0xD50330FFU', ipa_src)  # SB
         self.assertIn('0xD5033FDFU', ipa_src)  # ISB
-        self.assertIn('0x9248DC00U', ipa_src)  # TBI-safe XPACD
+        self.assertIn('0xD503201FU', ipa_src)  # NOP for PAC/AUT/XPACI/XPACD/XPACLRI
         self.assertIn('0xFFFFFC00U', ipa_src)  # Tightened branch-with-PAC mask
 
     def test_depac_builtin_dsc_and_scatter_selftest(self):

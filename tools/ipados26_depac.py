@@ -13,9 +13,7 @@ Instruction rewrites (all exact 4-byte replacements, zero branch displacement):
   - ERETAA / ERETAB                     -> ERET   (0xD69F03E0)
   - PACIA/IB/DA/DB/IZA/IZB/DZA/DZB      -> NOP    (0xD503201F)
   - AUTIA/IB/DA/DB/IZA/IZB/DZA/DZB      -> NOP    (0xD503201F)
-  - XPACI Xd                            -> AND Xd, Xd, #0x0000ffffffffffff
-  - XPACD Xd                            -> AND Xd, Xd, #0xff00ffffffffffff (preserves TBI [63:56]!)
-  - XPACLRI                             -> AND X30, X30, #0x0000ffffffffffff (strips LR PAC in unwinders!)
+  - XPACI / XPACD / XPACLRI             -> NOP    (0xD503201F; preserves TBI [63:56] & negative sentinels -1/-2!)
   - DC CVAP / DC CVADP Xt               -> DC CVAC Xt (ARMv8.2/v8.5 persistence flush -> native ARMv8.0 PoC, 0 traps!)
   - SB (0xD50330FF)                     -> ISB (0xD5033FDF) (ARMv8.5 speculation barrier -> native ARMv8.0 ISB, prevents SIGILL!)
   - LDAPR / LDAPRB / LDAPRH             -> LDAR / LDARB / LDARH (native ARMv8.0 acquire, 0 traps!)
@@ -74,11 +72,10 @@ INSN_NOP = 0xD503201F
 INSN_RET = 0xD65F03C0
 INSN_ERET = 0xD69F03E0
 INSN_ISB = 0xD5033FDF
-# XPACI: AND Xd, Xd, #0x0000ffffffffffff -> N=1, immr=0, imms=47 (0x2F): 0x9240BC00 | (Rd<<5) | Rd
-INSN_AND_48BIT_BASE = 0x9240BC00
-# XPACD: AND Xd, Xd, #0xff00ffffffffffff -> N=1, immr=8, imms=55 (0x37): 0x9248DC00 | (Rd<<5) | Rd
-# Preserves Darwin TBI top byte [63:56] (ObjC tagged/non-pointer isa, Swift, nanov2 malloc) while stripping PAC [55:48]!
-INSN_AND_TBI_48BIT_BASE = 0x9248DC00
+# Because all PAC* and AUT* are rewritten to NOP and dyld runs with ptrauth_disabled=1,
+# pointers never carry PAC signatures in [63:48]. Rewriting XPACI, XPACD, and XPACLRI to NOP
+# preserves both Darwin TBI [63:56] AND negative sentinel pointers (-1, -2 = 0xfffffffffffffffe
+# in libdispatch), preventing Clang -fptrauth-auth-traps (autda + xpacd + cmp + brk #0xc472) traps!
 
 PAC_HINT_IMM7 = frozenset((8, 10, 12, 14, 24, 25, 26, 27, 28, 29, 30, 31))
 FP16_SCALAR_1SRC_OPCS = frozenset((0, 1, 2, 3, 8, 9, 10, 11, 12, 14, 15))
@@ -190,9 +187,9 @@ def rewrite_arm64e_insn(insn):
     # Group A: System / Hints / Barriers / Unconditional Branch (register) [0xD5..0xD7]
     if 0xD5 <= b3 <= 0xD7:
         if b3 == 0xD5:
-            # ARMv8.3 XPACLRI (HINT #7) -> AND X30, X30, #0x0000ffffffffffff (strips LR PAC in unwinders):
+            # ARMv8.3 XPACLRI (HINT #7) -> NOP (LR never carries PAC bits on De-PAC'd system):
             if insn == 0xD50320FF:
-                return INSN_AND_48BIT_BASE | (30 << 5) | 30, 'xpaclri'
+                return INSN_NOP, 'xpaclri'
             # ARMv8.5 SB (0xD50330FF, CRn=3, CRm=0, op2=7) -> unallocated on ARMv8.0 (SIGILL); rewrite to ISB:
             if insn == 0xD50330FF:
                 return INSN_ISB, 'sb_isb'
@@ -240,13 +237,9 @@ def rewrite_arm64e_insn(insn):
             if op2 <= 7 or (op2 <= 15 and rn == 31):
                 return INSN_NOP, 'pac_aut'
             if op2 == 16 and rn == 31:
-                if rd == 31:
-                    return INSN_NOP, 'xpaci'
-                return INSN_AND_48BIT_BASE | (rd << 5) | rd, 'xpaci'
+                return INSN_NOP, 'xpaci'
             if op2 == 17 and rn == 31:
-                if rd == 31:
-                    return INSN_NOP, 'xpacd'
-                return INSN_AND_TBI_48BIT_BASE | (rd << 5) | rd, 'xpacd'
+                return INSN_NOP, 'xpacd'
         elif (insn & 0xFFE0FC00) == 0x9AC03000:
             return insn, 'pacga_trap_left'
         return insn, None
@@ -930,9 +923,9 @@ def run_selftest():
         ("PACDA X16, X17 -> NOP", 0xDAC10800 | (17 << 5) | 16, 0xD503201F, "pac_aut"),
         ("AUTIA X0, X1 -> NOP", 0xDAC11000 | (1 << 5) | 0, 0xD503201F, "pac_aut"),
         ("AUTDZB X5 -> NOP", 0xDAC13FE0 | 5, 0xD503201F, "pac_aut"),
-        ("XPACI X0 -> AND X0, X0, #0x0000ffffffffffff", 0xDAC143E0 | 0, 0x9240BC00, "xpaci"),
+        ("XPACI X0 -> NOP", 0xDAC143E0 | 0, 0xD503201F, "xpaci"),
         ("XPACI XZR -> NOP", 0xDAC143FF, 0xD503201F, "xpaci"),
-        ("XPACD X16 -> AND X16, X16, #0xff00ffffffffffff (preserve TBI)", 0xDAC147E0 | 16, 0x9248DC00 | (16 << 5) | 16, "xpacd"),
+        ("XPACD X16 -> NOP (preserve TBI & negative sentinels)", 0xDAC147E0 | 16, 0xD503201F, "xpacd"),
         ("XPACD XZR -> NOP", 0xDAC147FF, 0xD503201F, "xpacd"),
         ("LDAPRB W2, [X3] -> LDARB W2, [X3]", 0x38BFC000 | (3 << 5) | 2, 0x08DFFC00 | (3 << 5) | 2, "ldapr_ldar"),
         ("LDAPR X8, [X9] -> LDAR X8, [X9]", 0xF8BFC000 | (9 << 5) | 8, 0xC8DFFC00 | (9 << 5) | 8, "ldapr_ldar"),
@@ -954,7 +947,7 @@ def run_selftest():
         ("SSBB (DSB #0) -> native ARMv8.0 DSB SY", 0xD503309F, 0xD503309F, None),
         ("PSSBB (DSB #4) -> native ARMv8.0 DSB SY", 0xD503349F, 0xD503349F, None),
         ("CSDB -> native ARMv8.0 hint", 0xD503229F, 0xD503229F, None),
-        ("XPACLRI -> AND X30, X30, #0x0000ffffffffffff", 0xD50320FF, 0x9240BFDE, "xpaclri"),
+        ("XPACLRI -> NOP", 0xD50320FF, 0xD503201F, "xpaclri"),
         ("PACIBZ hint -> untouched", 0xD503237F, 0xD503237F, "pac_hint_nop"),
         ("SDOT V0.4S, V1.16B, V2.16B -> feat_dotprod", 0x4E829420, 0x4E829420, "feat_dotprod"),
         ("UDOT V0.2S, V1.8B, V2.4B[2] -> feat_dotprod", 0x2F82E820, 0x2F82E820, "feat_dotprod"),

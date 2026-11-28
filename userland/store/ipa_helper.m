@@ -61,16 +61,15 @@ extern char **environ;
 #define DEPAC_CS_HASHTYPE_SHA256_TRUNC    3U
 #define DEPAC_CS_HASHTYPE_SHA384          4U
 
-/* Native ARMv8.0 replacement instruction encodings (exact match to tools/ipados26_depac.py) */
+/* Native ARMv8.0 replacement instruction encodings (exact match to tools/ipados26_depac.py).
+ * Because all PAC* and AUT* instructions are rewritten to NOP and dyld runs with
+ * ptrauth_disabled=1, pointers never carry PAC bits in [63:48]. Rewriting XPACI, XPACD,
+ * and XPACLRI to NOP preserves both Darwin TBI [63:56] AND negative sentinel pointers
+ * such as -1 / -2 (0xfffffffffffffffe in libdispatch), preventing -fptrauth-auth-traps
+ * cmp + brk #0xc472 traps! */
 #define DEPAC_INSN_NOP              0xD503201FU
 #define DEPAC_INSN_RET              0xD65F03C0U
 #define DEPAC_INSN_ERET             0xD69F03E0U
-/* XPACI: AND Xd, Xd, #0x0000ffffffffffff -> N=1, immr=0, imms=47 (0x2F): 0x9240BC00 | (Rd<<5) | Rd */
-#define DEPAC_INSN_AND_48BIT_BASE   0x9240BC00U
-/* XPACD: AND Xd, Xd, #0xff00ffffffffffff -> N=1, immr=8, imms=55 (0x37): 0x9248DC00 | (Rd<<5) | Rd
- * Preserves Darwin TBI top byte [63:56] (ObjC tagged/non-pointer isa, Swift, nanov2 malloc)
- * while stripping PAC bits [55:48]! */
-#define DEPAC_INSN_AND_TBI_48BIT    0x9248DC00U
 
 #define DEPAC_SECT_INSN_ATTRS       (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
 
@@ -165,17 +164,8 @@ static uint32_t depac_rewrite_arm64e_insn(uint32_t insn)
 	if ((insn & 0xFFFF8000U) == 0xDAC10000U) {
 		uint32_t op2 = (insn >> 10) & 0x1FU;
 		uint32_t rn = (insn >> 5) & 0x1FU;
-		uint32_t rd = insn & 0x1FU;
-		if (op2 <= 7U || (op2 <= 15U && rn == 31U)) {
+		if (op2 <= 7U || (op2 <= 17U && rn == 31U)) {
 			return DEPAC_INSN_NOP;
-		}
-		if (op2 == 16U && rn == 31U) {
-			if (rd == 31U) return DEPAC_INSN_NOP;
-			return DEPAC_INSN_AND_48BIT_BASE | (rd << 5) | rd;
-		}
-		if (op2 == 17U && rn == 31U) {
-			if (rd == 31U) return DEPAC_INSN_NOP;
-			return DEPAC_INSN_AND_TBI_48BIT | (rd << 5) | rd;
 		}
 	}
 
@@ -210,9 +200,9 @@ static uint32_t depac_rewrite_arm64e_insn(uint32_t insn)
 		return 0xD50B7A20U | (insn & 0x1FU);
 	}
 
-	/* 7. ARMv8.3 XPACLRI (HINT #7) -> AND X30, X30, #0x0000ffffffffffff (0x9240BFDE) */
+	/* 7. ARMv8.3 XPACLRI (HINT #7) -> NOP (LR never carries PAC bits) */
 	if (insn == 0xD50320FFU) {
-		return DEPAC_INSN_AND_48BIT_BASE | (30U << 5) | 30U;
+		return DEPAC_INSN_NOP;
 	}
 
 	/* 8. ARMv8.5 SB (0xD50330FF) -> ISB (0xD5033FDF): unallocated on ARMv8.0-A */

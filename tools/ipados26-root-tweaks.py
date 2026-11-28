@@ -151,6 +151,17 @@ def patch_launchd(root):
 
 
 def setup_containers(root):
+    # Ensure /bin/sh exists as a real executable copy of /bin/bash (not a Linux hfsplus symlink)
+    sh_path = os.path.join(root, 'bin/sh')
+    bash_path = os.path.join(root, 'bin/bash')
+    if os.path.isfile(bash_path) and not os.path.isfile(sh_path):
+        if os.path.islink(sh_path):
+            os.unlink(sh_path)
+        shutil.copyfile(bash_path, sh_path)
+        chown_safe(sh_path, 0, 0)
+        os.chmod(sh_path, 0o755)
+        print('staged /bin/sh from /bin/bash')
+
     base = os.path.join(root, 'private/var/containers')
     for sub, uid in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
         d = os.path.join(base, sub)
@@ -159,6 +170,29 @@ def setup_containers(root):
             chown_safe(d, uid, uid)
             os.chmod(d, 0o755)
             print('mkdir', d)
+
+    # Pre-create /private/var/mobile/Containers hierarchy owned by mobile:mobile (501:501) so
+    # containermanagerd_system (uid=0) never creates Containers or Data owned by root:501, which
+    # would block containermanagerd (uid=501) from creating Data/InternalDaemon or Shared/AppGroup.
+    mob_base = os.path.join(root, 'private/var/mobile/Containers')
+    for rel in (
+        '',
+        'Data',
+        'Data/Application',
+        'Data/InternalDaemon',
+        'Data/PluginKitPlugin',
+        'Data/TempDir',
+        'Shared',
+        'Shared/AppGroup',
+        'Staging',
+        'Temp',
+    ):
+        d = os.path.join(mob_base, rel) if rel else mob_base
+        os.makedirs(d, exist_ok=True)
+        chown_safe(d, MOBILE, MOBILE)
+        os.chmod(d, 0o755)
+    print('mobile Containers hierarchy ready (501:501):', mob_base)
+
     # Persistent Adreno 610 ir3 Metal shader cache across reboots (checked first by HakiosMetal / HakiosMetalCA)
     shader_cache = os.path.join(root, 'private/var/db/hakios-metal-cache')
     os.makedirs(shader_cache, exist_ok=True)
@@ -195,29 +229,35 @@ def find_container(root, kind, identifier):
 
 
 def seed_activation(root):
-    c = find_container(root, 'Data/System', 'com.apple.mobileactivationd')
-    if c is None:
-        c = os.path.join(root, 'private/var/containers/Data/System/mobileactivationd-sweet')
-        os.makedirs(c, exist_ok=True)
-        save(os.path.join(c, '.com.apple.mobile_container_manager.metadata.plist'), {
-            'MCMMetadataContentClass': 12,
-            'MCMMetadataIdentifier': 'com.apple.mobileactivationd',
-            'MCMMetadataUUID': '53574545-5432-3631-0000-000000000001',
-            'MCMMetadataVersion': 1,
-        }, 0, 0, 0o644)
-    d = os.path.join(c, 'Library/internal')
-    os.makedirs(d, exist_ok=True)
-    chown_safe(d, MOBILE, MOBILE)
-    os.chmod(d, 0o755)
-    save(os.path.join(d, 'data_ark.plist'), {
+    ark_payload = {
         '-ActivationState': 'Activated',
         '-BrickState': False,
         '-BuildVersion': BUILD,
         '-ProductVersion': VERSION,
         '-DataMigrationCompleted': True,
         '-PreSydroDataMigrationCompleted': True,
-    }, MOBILE, MOBILE, 0o600)
-    print('data ark seeded:', d)
+    }
+    stale = os.path.join(root, 'private/var/containers/Data/System/mobileactivationd-sweet')
+    if os.path.isdir(stale):
+        shutil.rmtree(stale)
+
+    # Seed legacy Sydro migration source so mobileactivationd's _perform_sydro_data_migration_tasks
+    # migrates ActivationState=Activated cleanly into the freshly created UUID System container.
+    mad_dir = os.path.join(root, 'private/var/mobile/Library/mad')
+    os.makedirs(mad_dir, exist_ok=True)
+    chown_safe(mad_dir, MOBILE, MOBILE)
+    os.chmod(mad_dir, 0o755)
+    save(os.path.join(mad_dir, 'data_ark.plist'), ark_payload, MOBILE, MOBILE, 0o600)
+    print('legacy mad data_ark seeded:', mad_dir)
+
+    c = find_container(root, 'Data/System', 'com.apple.mobileactivationd')
+    if c is not None:
+        d = os.path.join(c, 'Library/internal')
+        os.makedirs(d, exist_ok=True)
+        chown_safe(d, MOBILE, MOBILE)
+        os.chmod(d, 0o755)
+        save(os.path.join(d, 'data_ark.plist'), ark_payload, MOBILE, MOBILE, 0o600)
+        print('system container data_ark seeded:', d)
 
 
 def patch_audio_and_media(root):

@@ -317,6 +317,22 @@ index 35be399..71991cb 100644
  #include <pexpert/pexpert.h>
  #include <kern/locks.h>
  #include <sys/kpi_mbuf.h>
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index c1c3929..e3d0652 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -286,6 +286,11 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 	} else {
+ 		if (flags & CS_VALID) {
+ 			flags &= ~CS_VALID;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			if (!send_kill) {
++				flags |= CS_DEBUGGED;
++			}
++#endif
+ 			cs_procs_invalidated++;
+ 			verbose = 1;
+ 			proc_csflags_update(p, flags);
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index e7bf9a3..8120341 100644
 --- a/bsd/kern/kern_exec.c
@@ -364,8 +380,75 @@ index e7bf9a3..8120341 100644
  
  
  #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index f00256b..632e716 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3674,6 +3674,9 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		break;
+ 
+ 	case CS_OPS_MARKHARD:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		break;
++#else
+ 		proc_lock(pt);
+ 		proc_csflags_set(pt, CS_HARD);
+ 		if ((proc_getcsflags(pt) & CS_VALID) == 0) {
+@@ -3685,8 +3688,12 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 			proc_unlock(pt);
+ 		}
+ 		break;
++#endif
+ 
+ 	case CS_OPS_MARKKILL:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		break;
++#else
+ 		proc_lock(pt);
+ 		proc_csflags_set(pt, CS_KILL);
+ 		if ((proc_getcsflags(pt) & CS_VALID) == 0) {
+@@ -3696,6 +3703,7 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 			proc_unlock(pt);
+ 		}
+ 		break;
++#endif
+ 
+ 	case CS_OPS_PIDOFFSET:
+ 		toff = pt->p_textoff;
+@@ -3856,8 +3864,15 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		    CS_REQUIRE_LV |
+ 		    CS_ENFORCEMENT | CS_EXEC_SET_ENFORCEMENT;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		flags &= ~(CS_HARD | CS_EXEC_SET_HARD | CS_KILL | CS_EXEC_SET_KILL);
++#endif
+ 		proc_lock(pt);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) {
++#else
+ 		if (proc_getcsflags(pt) & CS_VALID) {
++#endif
+ 			if ((flags & CS_ENFORCEMENT) &&
+ 			    !(proc_getcsflags(pt) & CS_ENFORCEMENT)) {
+ 				vm_map_cs_enforcement_set(get_task_map(proc_task(pt)), TRUE);
+diff --git a/bsd/kern/proc_info.c b/bsd/kern/proc_info.c
+index 1f1e11c..5585b47 100644
+--- a/bsd/kern/proc_info.c
++++ b/bsd/kern/proc_info.c
+@@ -2532,6 +2532,11 @@ proc_pidinfo(int pid, uint32_t flags, uint64_t ext_id, int flavor, uint64_t arg,
+ 		proc_lock(p);
+ 		uint32_t platform = proc_platform(p);
+ 		proc_unlock(p);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (platform == 0) {
++			platform = 2; /* PLATFORM_IOS */
++		}
++#endif
+ 		error = copyout(&platform, buffer, sizeof(uint32_t));
+ 		if (error == 0) {
+ 			*retval = sizeof(uint32_t);
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index a201ae4..74cd9bf 100644
+index a201ae4..7294979 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
 @@ -55,6 +55,8 @@ SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CT
@@ -400,7 +483,7 @@ index a201ae4..74cd9bf 100644
  		uint32_t token[8];
  		error = copyin((user_addr_t)a[0], token, sizeof(token));
  		if (error) {
-@@ -449,14 +456,61 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+@@ -449,14 +456,125 @@ sweet_sandbox_extension_consume(user_addr_t arg)
  	return error;
  }
  
@@ -435,14 +518,78 @@ index a201ae4..74cd9bf 100644
 +}
 +
 +static int
++sweet_sandbox_inspect_subsystem(user_addr_t arg)
++{
++	/*
++	 * _sb_inspect_subsystem(subsys, uid, buf, buflen, &out_len, flags):
++	 * Caller leaves out_len uninitialized on the stack and on the first probe
++	 * passes buf == NULL, buflen == 0 expecting ERANGE with out_len == 0 before
++	 * retrying with malloc(out_len + 0x1000).
++	 */
++	uint64_t a[6] = { 0 };
++	uint64_t out_len = 0;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	if (a[4] != 0) {
++		error = copyout(&out_len, (user_addr_t)a[4], sizeof(out_len));
++		if (error != 0) {
++			return error;
++		}
++	}
++	if (a[2] == 0) {
++		return ERANGE;
++	}
++	return 0;
++}
++
++static int
++sweet_sandbox_check_protected_container(user_addr_t arg)
++{
++	/*
++	 * _sandbox_check_protected_app_container(fd, &is_protected, &flags2):
++	 * a[0] = fd, a[1] = &flags_byte (bit 0 = is_protected, bit 1 = flags2).
++	 * Returning 0 without setting bit 0 causes MCMCommandQuery to reject
++	 * requireSecureByPlatformPolicy containers with MCMError(0xa1, 6).
++	 */
++	uint64_t a[2] = { 0 };
++	uint8_t flags = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[1] != 0) {
++		error = copyout(&flags, (user_addr_t)a[1], sizeof(flags));
++	}
++	return error;
++}
++
++static int
 +sweet_sandbox_check_storage_class(user_addr_t arg)
 +{
-+	uint64_t a[4];
-+	uint8_t allowed = 1;
++	/*
++	 * _sandbox_check_storage_class: userland reads uint8_t from *a[3] and
++	 * computes `eor w8, w8, #0x1` (0 = allowed, 1 = denied).
++	 */
++	uint64_t a[4] = { 0 };
++	uint8_t denied = 0;
 +	int error = copyin(arg, a, sizeof(a));
 +
 +	if (error == 0 && a[3] != 0) {
-+		error = copyout(&allowed, (user_addr_t)a[3], sizeof(allowed));
++		error = copyout(&denied, (user_addr_t)a[3], sizeof(denied));
++	}
++	return error;
++}
++
++static int
++sweet_sandbox_rootless_protected_vol(user_addr_t arg)
++{
++	uint64_t a[2] = { 0 };
++	uint64_t prot = 0;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[1] != 0) {
++		error = copyout(&prot, (user_addr_t)a[1], sizeof(prot));
 +	}
 +	return error;
 +}
@@ -467,18 +614,25 @@ index a201ae4..74cd9bf 100644
  	}
  	switch (call) {
  	case 4:         /* container path (pid / audit token) */
-@@ -465,47 +519,77 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+@@ -465,47 +583,84 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  		return sweet_sandbox_extension_issue(arg);
  	case 6:         /* extension consume */
  		return sweet_sandbox_extension_consume(arg);
 -	case 0x43:      /* container expected */
 -		return ENOENT;
++	case 0x10:      /* _sb_inspect_subsystem */
++		return sweet_sandbox_inspect_subsystem(arg);
 +	case 0x1c:      /* sandbox_reference_retain_by_audit_token */
 +		return sweet_sandbox_reference_retain(arg);
 +	case 0x43:      /* sandbox_get_container_expected: 0 = not containerized */
 +		return sweet_sandbox_container_expected(arg);
-+	case 0x57:      /* sandbox_check_storage_class: *out = 1 (allowed) */
++	case 0x4d:      /* _sandbox_check_protected_app_container: *out = 1 */
++		return sweet_sandbox_check_protected_container(arg);
++	case 0x57:      /* _sandbox_check_storage_class: *out = 0 (not denied) */
 +		return sweet_sandbox_check_storage_class(arg);
++	case 0x103:     /* _rootless_protected_volume */
++	case 0x104:     /* _rootless_protected_volume_fd */
++		return sweet_sandbox_rootless_protected_vol(arg);
  	default:
  		return 0;
  	}
@@ -566,6 +720,33 @@ index a201ae4..74cd9bf 100644
  }
  
  static int
+@@ -541,7 +696,9 @@ static int sweet_priv_logged_count;
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+-	if (priv == PRIV_WORK_INTERVAL) {
++	if (priv == PRIV_WORK_INTERVAL ||
++	    priv == PRIV_GLOBAL_PROC_INFO ||
++	    priv == PRIV_VM_FOOTPRINT_LIMIT) {
+ 		return 0;
+ 	}
+ 	char name[20];
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 67a2414..aee3ee3 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -11104,7 +11104,11 @@ vnode_authattr(vnode_t vp, struct vnode_attr *vap, kauth_action_t *actionp, vfs_
+ 					goto out;
+ 				}
+ 			} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				if (fdelta & ~(UF_SETTABLE | SF_NOUNLINK)) {
++#else
+ 				if (fdelta & ~UF_SETTABLE) {
++#endif
+ 					error = EPERM;
+ 					KAUTH_DEBUG("  DENIED - user attempt to set illegal flag(s)");
+ 					goto out;
 diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
 index c7b3a77..ca63728 100644
 --- a/iokit/Kernel/IOCPU.cpp
@@ -772,21 +953,6 @@ index 917ecd5..0b4585a 100644
  			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
  		} else {
  #if HAS_FEAT_XS
-diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
-new file mode 100644
-index 0000000..963cdc1
---- /dev/null
-+++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
-@@ -0,0 +1,9 @@
-+/*
-+ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
-+ * in Apple's closed per-SoC library. It implements the AMCC read-only region
-+ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
-+ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
-+ */
-+#include <stdint.h>
-+
-+static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
 diff --git a/osfmk/arm64/bzero.s b/osfmk/arm64/bzero.s
 index 0d3934b..4d61fc5 100644
 --- a/osfmk/arm64/bzero.s
