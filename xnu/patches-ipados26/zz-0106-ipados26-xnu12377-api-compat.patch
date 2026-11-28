@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
-index 0628506..1d97d56 100644
+index 0628506..7ed5a92 100644
 --- a/bsd/dev/sweet_reboot.c
 +++ b/bsd/dev/sweet_reboot.c
-@@ -3,16 +3,45 @@
+@@ -3,16 +3,47 @@
   * kern.sweet_reboot_mode = 0 system (Android, from the boot partition), 1 recovery, 2 bootloader
   * (fastboot, the default: iOS is only ever started with fastboot boot); boot-arg sweet_reboot=N
   * sets the default.
@@ -22,6 +22,8 @@ index 0628506..1d97d56 100644
  #include <pexpert/pexpert.h>
  
 +extern void sweet_log_sync(unsigned max_ms);
++extern bool sweet_log_has_flushed(void);
++extern void sweet_log_panic_flush(void);
 +extern uint64_t sweet_log_position(void);
 +extern int sweet_spmi_set_reboot_reason(unsigned mode);
 +
@@ -48,7 +50,7 @@ index 0628506..1d97d56 100644
  
  /* 0299: Volume up held during the boot screen (sweet_keys.c): the next restart goes to recovery */
  void
-@@ -34,6 +63,80 @@ sweet_reboot_mode_get(void)
+@@ -34,6 +65,83 @@ sweet_reboot_mode_get(void)
  	return sweet_reboot_mode;
  }
  
@@ -70,6 +72,9 @@ index 0628506..1d97d56 100644
 +			printf("\n=== SWEET AUTOREBOOT: %u seconds reached -- syncing SWEETLOG & rebooting (mode %d) ===\n",
 +			    elapsed, mode);
 +			sweet_log_sync(2000);
++			if (!sweet_log_has_flushed()) {
++				sweet_log_panic_flush();
++			}
 +			(void)sweet_spmi_set_reboot_reason((unsigned)mode);
 +			delay(20000);
 +			sweet_psci_reset_now();
@@ -129,7 +134,7 @@ index 0628506..1d97d56 100644
  static int
  sysctl_sweet_reboot_mode SYSCTL_HANDLER_ARGS
  {
-@@ -53,4 +156,7 @@ sysctl_sweet_reboot_mode SYSCTL_HANDLER_ARGS
+@@ -53,4 +161,7 @@ sysctl_sweet_reboot_mode SYSCTL_HANDLER_ARGS
  
  SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
      0, 0, sysctl_sweet_reboot_mode, "I", "where a restart goes: 0 system, 1 recovery, 2 bootloader");
@@ -171,7 +176,7 @@ index b584236..109a34a 100644
  		if (err) {
  			return err;
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index ae5a1cb..4a3176c 100644
+index ae5a1cb..c6f49ae 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -35,6 +35,7 @@
@@ -182,6 +187,124 @@ index ae5a1cb..4a3176c 100644
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
+@@ -43,7 +44,9 @@
+ #include <sys/kauth.h>
+ #include "sweet_slot.h"
+ 
++extern vm_offset_t vm_kernel_etext;
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern addr64_t kvtophys(vm_offset_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+@@ -987,20 +990,95 @@ sweet_log_sync(unsigned max_ms)
+  * reader knows this flush came from a panic. Without this the only trace of a panic
+  * is the screen, and the last ufslogsecs of console before it are gone.
+  */
++#define PANIC_BOUNCE_BLOCKS 16u
++static uint8_t sweet_panic_dma[DMA_BOUNCE + PANIC_BOUNCE_BLOCKS * UFS_BLOCK] __attribute__((aligned(16384)));
++
++bool sweet_log_has_flushed(void);
++bool
++sweet_log_has_flushed(void)
++{
++	return os_atomic_load(&sweet_log_flushed, relaxed) > 0;
++}
++
++static bool
++sweet_ufs_emergency_init(void)
++{
++	uint32_t rw = 0, on = 1;
++	char want[64] = "userdata";
++	uintptr_t ufs_pa = 0x04804000UL, ufs_sz = 0x10000UL;
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int rsz = 0;
++
++	if (!vm_kernel_etext) {
++		return false;
++	}
++	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!rw || !on) {
++		return false;
++	}
++	if (su.ready && su.writable && su.nblocks >= 2 * SWEET_LOG_BLOCKS) {
++		return true;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &rsz) == kSuccess &&
++	    rsz >= 2 * sizeof(uintptr_t)) {
++		ufs_pa = reg[0];
++		ufs_sz = reg[1];
++	}
++	if (!su.regs) {
++		su.regs = ml_io_map(ufs_pa, ufs_sz);
++	}
++	if (!su.regs) {
++		return false;
++	}
++	su.dma = (vm_offset_t)sweet_panic_dma;
++	su.dma_pa = (uint64_t)kvtophys(su.dma);
++	if (!su.dma_pa) {
++		return false;
++	}
++	su.lun = 0;
++	su.cache = false;
++	su.wait = false;
++	for (int i = 0; i < 500 && ufs_rd(REG_UTRLDBR); i++) {
++		delay(1000);
++	}
++	if (ufs_take_over_host() != 0) {
++		return false;
++	}
++	static const uint8_t tur[6] = { 0x00 };
++	for (int i = 0; i < 3 && ufs_scsi(tur, sizeof(tur), 0, false) != 0; i++) {
++	}
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	if (ufs_find_partition(want) != 0 || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return false;
++	}
++	su.writable = true;
++	return true;
++}
++
+ void sweet_log_panic_flush(void);
+ 
+ void
+ sweet_log_panic_flush(void)
+ {
+ 	static bool done;
+-	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint32_t max_blks = (uint32_t)(BOUNCE_SIZE / UFS_BLOCK);
+ 	int error = 0;
+ 
+-	if (done || !sweet_log_on) {
++	if (done) {
+ 		return;
+ 	}
++	if (!sweet_log_on) {
++		if (!sweet_ufs_emergency_init()) {
++			return;
++		}
++		max_blks = PANIC_BOUNCE_BLOCKS;
++	}
+ 	done = true;
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 	for (int i = 0; i < 3000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
+ 		delay(1000);
+ 	}
+@@ -1012,7 +1090,7 @@ sweet_log_panic_flush(void)
+ 		uint32_t blk = off / UFS_BLOCK;
+ 		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		    (uint64_t)max_blks);
+ 		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+ 		error = ufs_write_blocks(base + 1 + blk, n);
+ 		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index 35be399..71991cb 100644
 --- a/bsd/dev/sweet_usb.c
