@@ -9,7 +9,8 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 rw="ufsrw=1 rootrw=1"
 con="sweetfb_noconsole=1"
 ufsroot="iosroot"
-gpu_args="sweetmetal=0 sweetgl=0 sweet_glload=0"
+gpu_mode="cpu"
+gpu_delay=""
 autoreboot_args=""
 gpufw=()
 adt_opts=()
@@ -19,8 +20,9 @@ while [[ ${1:-} == --* ]]; do
 	--readonly) rw="" ;;
 	--console) con="" ;;
 	--amp) adt_opts+=(--amp); cpus=8 ;;
-	--gpu) gpu_args="gpu=3 gpu_delay=20 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=2 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
-	--metal-stub) gpu_args="gpu=3 gpu_delay=20 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=1 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
+	--gpu) gpu_mode="gpu" ;;
+	--metal-stub) gpu_mode="metal-stub" ;;
+	--gpu-delay) shift; gpu_delay="$1" ;;
 	--cellular) adt_opts+=(--cellular) ;;
 	--ipad-canvas) adt_opts+=(--ipad-canvas) ;;
 	--home-button) adt_opts+=(--home-button) ;;
@@ -44,6 +46,15 @@ while [[ ${1:-} == --* ]]; do
 	esac
 	shift
 done
+
+if [[ -z $gpu_delay ]]; then
+	if [[ -n $autoreboot_args ]]; then gpu_delay=2; else gpu_delay=5; fi
+fi
+case $gpu_mode in
+gpu) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=2 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
+metal-stub) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=1 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
+*) gpu_args="sweetmetal=0 sweetgl=0 sweet_glload=0" ;;
+esac
 
 [[ $# -ge 1 ]] || { sed -n '2,5p' "$0" >&2; exit 2; }
 kernel=$(realpath "$1")

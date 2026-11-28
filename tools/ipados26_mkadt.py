@@ -103,6 +103,7 @@ def build(seed=None, qemu=False, highmem=False, midmem=False, ipad_canvas=False,
         ('protected-data-access', u32(1)),
         ('amfi-allows-trust-cache-load', u32(1)),
         ('unrestricted-subsystem-root', u32(1)),
+        ('kernel-ctrr-to-be-enabled', u32(1)),
     ] + list(gpu_fw), [
         node('memory-map', [ph()]),
         node('boot-object-manifests', [ph()]),

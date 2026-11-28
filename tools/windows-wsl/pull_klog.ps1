@@ -2,7 +2,7 @@ param(
     [string]$AdbPath = "adb.exe",
     [string]$Partition = "iosroot",
     [string]$OutFile = "logs\ipados26-xnu.log",
-    [string]$AndroidDownloadCopy = "/sdcard/Download/ipados26-xnu.log"
+    [string]$AndroidDownloadCopy = "/data/media/0/Download/ipados26-xnu.log"
 )
 
 $ErrorActionPreference = "Stop"
