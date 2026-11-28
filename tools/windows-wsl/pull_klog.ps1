@@ -28,7 +28,8 @@ python (Join-Path $repo "tools\ipados26-klog.py") $tmpArea $fullOut
 Remove-Item -Force -ErrorAction SilentlyContinue $tmpArea
 
 if ($AndroidDownloadCopy) {
-    & $AdbPath push $fullOut $AndroidDownloadCopy | Out-Null
+    & $AdbPath push $fullOut /data/local/tmp/ipados26-xnu.log | Out-Null
+    & $AdbPath shell "su -c 'cp -f /data/local/tmp/ipados26-xnu.log $AndroidDownloadCopy && chmod 664 $AndroidDownloadCopy && rm -f /data/local/tmp/ipados26-xnu.log'"
     Write-Output "Saved XNU log on Android: $AndroidDownloadCopy"
 }
 Write-Output "Saved XNU log on PC:      $fullOut"

@@ -414,6 +414,25 @@ index 0000000..963cdc1
 +#include <stdint.h>
 +
 +static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/bzero.s b/osfmk/arm64/bzero.s
+index 0d3934b..4d61fc5 100644
+--- a/osfmk/arm64/bzero.s
++++ b/osfmk/arm64/bzero.s
+@@ -76,7 +76,14 @@ L_bzeroLarge:
+     add     x4,      x3, #64  // end of first cacheline to zero
+     subs    x2,      x2, x4   // if the end of the buffer comes first, jump
+     b.ls    1f                //    directly to the cleanup pass.
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++0:  stp     x1, x1, [x3]
++    stp     x1, x1, [x3, #16]
++    stp     x1, x1, [x3, #32]
++    stp     x1, x1, [x3, #48]
++#else
+ 0:  dc      zva,     x3       // zero cacheline
++#endif
+     add     x3,      x3, #64  // increment pointer
+     subs    x2,      x2, #64  // decrement length
+     b.hi    0b
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
 index 68801b8..61ba996 100644
 --- a/osfmk/arm64/cpu.c
@@ -426,6 +445,20 @@ index 68801b8..61ba996 100644
  		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
  		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
  		__builtin_arm_dsb(DSB_SY);
+diff --git a/osfmk/arm64/loose_ends.c b/osfmk/arm64/loose_ends.c
+index dd4b769..b99cae8 100644
+--- a/osfmk/arm64/loose_ends.c
++++ b/osfmk/arm64/loose_ends.c
+@@ -373,7 +373,9 @@ bzero_phys_internal(addr64_t src, vm_size_t bytes, __unused int options)
+ #endif
+ 		switch (wimg_bits & VM_WIMG_MASK) {
+ 		case VM_WIMG_DEFAULT:
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 		case VM_WIMG_WCOMB:
++#endif
+ 		case VM_WIMG_INNERWBACK:
+ 		case VM_WIMG_WTHRU:
+ #if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 93c9d8b..1e28be5 100644
 --- a/osfmk/arm64/sleh.c
