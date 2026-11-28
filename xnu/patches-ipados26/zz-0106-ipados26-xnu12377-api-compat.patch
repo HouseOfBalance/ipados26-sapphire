@@ -364,6 +364,208 @@ index e7bf9a3..8120341 100644
  
  
  #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index a201ae4..74cd9bf 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -55,6 +55,8 @@ SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CT
+     &sweet_amfi_developer_mode, "developer mode (on: nothing is restricted here)");
+ SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, qa_root_certs_allowed, CTLFLAG_RD | CTLFLAG_LOCKED,
+     &sweet_amfi_qa_root_certs, "");
++SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_resolved, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_amfi_developer_mode, "developer mode resolved (iPadOS 26)");
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -341,7 +343,7 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * op 6, extension consume ({u64 token, u64 len, u64 out handle}): succeeds
+  *   with handle 1 (sandbox_extension_consume() returns it; -1 means failure).
+  */
+-static uint64_t sweet_sandbox_seen;
++static uint64_t sweet_sandbox_seen[5];
+ 
+ #define SWEET_SB_TOKEN_MAX      2048    /* libsystem_sandbox's output buffer */
+ 
+@@ -359,7 +361,12 @@ sweet_sandbox_container_path(user_addr_t arg)
+ 	if (error) {
+ 		return error;
+ 	}
+-	if (a[4] != 0) {        /* by audit token: a[0] points at it, its val[5] is the pid */
++	/*
++	 * Legacy libsystem_sandbox passed &audit_token in a[0] when a[4] != 0;
++	 * iPadOS 26.1 extracts audit_token.val[5] (pid) in userland and passes
++	 * the integer pid directly in a[0] with pidversion in a[1].
++	 */
++	if (a[4] != 0 && a[0] >= 0x100000ULL) {
+ 		uint32_t token[8];
+ 		error = copyin((user_addr_t)a[0], token, sizeof(token));
+ 		if (error) {
+@@ -449,14 +456,61 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+ 	return error;
+ }
+ 
++static int
++sweet_sandbox_reference_retain(user_addr_t arg)
++{
++	uint64_t a[3];
++	int64_t ref = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[2] != 0) {
++		error = copyout(&ref, (user_addr_t)a[2], sizeof(ref));
++	}
++	return error;
++}
++
++static int
++sweet_sandbox_container_expected(user_addr_t arg)
++{
++	uint64_t ptrs[2] = { 0, 0 };
++	uint64_t zero = 0;
++
++	if (arg != 0 && copyin(arg, ptrs, sizeof(ptrs)) == 0) {
++		if (ptrs[0] != 0) {
++			(void)copyout(&zero, (user_addr_t)ptrs[0], sizeof(zero));
++		}
++		if (ptrs[1] != 0) {
++			(void)copyout(&zero, (user_addr_t)ptrs[1], sizeof(zero));
++		}
++	}
++	return 0;
++}
++
++static int
++sweet_sandbox_check_storage_class(user_addr_t arg)
++{
++	uint64_t a[4];
++	uint8_t allowed = 1;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error == 0 && a[3] != 0) {
++		error = copyout(&allowed, (user_addr_t)a[3], sizeof(allowed));
++	}
++	return error;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+-	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+-		sweet_sandbox_seen |= 1ULL << call;
+-		char name[32];
+-		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("SWEET Sandbox: %s op %d\n", name, call);
++	if (call >= 0 && call < 320) {
++		unsigned int idx = (unsigned int)call >> 6;
++		uint64_t bit = 1ULL << ((unsigned int)call & 63U);
++		if ((sweet_sandbox_seen[idx] & bit) == 0) {
++			sweet_sandbox_seen[idx] |= bit;
++			char name[32];
++			proc_name(proc_pid(p), name, sizeof(name));
++			printf("SWEET Sandbox: %s op %d (0x%x)\n", name, call, (unsigned int)call);
++		}
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (pid / audit token) */
+@@ -465,47 +519,77 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
+ 		return sweet_sandbox_extension_consume(arg);
+-	case 0x43:      /* container expected */
+-		return ENOENT;
++	case 0x1c:      /* sandbox_reference_retain_by_audit_token */
++		return sweet_sandbox_reference_retain(arg);
++	case 0x43:      /* sandbox_get_container_expected: 0 = not containerized */
++		return sweet_sandbox_container_expected(arg);
++	case 0x57:      /* sandbox_check_storage_class: *out = 1 (allowed) */
++		return sweet_sandbox_check_storage_class(arg);
+ 	default:
+ 		return 0;
+ 	}
+ }
+ 
+ /*
+- * __mac_syscall("AMFI", ...). dyld asks what it may do for the process it starts (0x5a): without
+- * an answer it runs restricted and ignores the DYLD_* variables (ElleKit's injection uses them).
+- * Argument: { u64 flags in, user pointer to u64 flags out }. Everything else libamfi asks
+- * (amfi_interface_query_bootarg_state() in ExtensionFoundation, ...) succeeds and leaves the
+- * caller's output alone: with no policy of this name lsd's ExtensionKit said "Unable to find
+- * AMFI" and registered no app extension (PlugInKit -10814 everywhere, PosterBoard without
+- * wallpapers). (ios-topaz 0147/0109, after HackiOS.)
++ * __mac_syscall("AMFI", ...).
++ * - 0x5a: dyld policy check -> allow all (0xffULL).
++ * - 0x5f: amfi_interface_cdhash_in_trustcache -> *out = 1 (trusted).
++ * - 0x66: amfi_launch_constraint_matches_process -> *(uint32_t *)a[6] = 0 (matches).
++ * - 0x68: amfi_restricted_execution_mode_status -> ENOENT (Lockdown Mode off).
+  */
+-#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
+-#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++#define SWEET_AMFI_CHECK_DYLD_POLICY            0x5a
++#define SWEET_AMFI_CDHASH_IN_TRUSTCACHE         0x5f
++#define SWEET_AMFI_LAUNCH_CONSTRAINT_MATCHES    0x66
++#define SWEET_AMFI_RESTRICTED_EXEC_STATUS       0x68
++#define SWEET_AMFI_DYLD_ALLOW_ALL               0xffULL
+ 
+ static int
+ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ {
++	static uint64_t seen[5];
+ 	uint64_t in_out[2] = { 0, 0 };
+ 	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
+ 	int error;
+ 
+-	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
+-		static uint64_t seen;
+-		if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {
+-			seen |= 1ULL << call;
++	if (call >= 0 && call < 320) {
++		unsigned int idx = (unsigned int)call >> 6;
++		uint64_t bit = 1ULL << ((unsigned int)call & 63U);
++		if ((seen[idx] & bit) == 0) {
++			seen[idx] |= bit;
+ 			char name[32];
+ 			proc_selfname(name, sizeof(name));
+-			printf("SWEET AMFI: syscall %d from %s\n", call, name);
++			printf("SWEET AMFI: syscall %d (0x%x) from %s\n", call, (unsigned int)call, name);
+ 		}
+-		return 0;
+ 	}
+-	error = copyin(arg, in_out, sizeof(in_out));
+-	if (error == 0) {
+-		error = copyout(&allow, (user_addr_t)in_out[1], sizeof(allow));
++
++	switch (call) {
++	case SWEET_AMFI_CHECK_DYLD_POLICY:
++		error = copyin(arg, in_out, sizeof(in_out));
++		if (error == 0 && in_out[1] != 0) {
++			error = copyout(&allow, (user_addr_t)in_out[1], sizeof(allow));
++		}
++		return error;
++	case SWEET_AMFI_CDHASH_IN_TRUSTCACHE: {
++		uint64_t in_tc = 1;
++		if (arg == 0) {
++			return EINVAL;
++		}
++		return copyout(&in_tc, arg + 0x18, sizeof(in_tc));
++	}
++	case SWEET_AMFI_LAUNCH_CONSTRAINT_MATCHES: {
++		uint64_t a[8];
++		uint32_t ok = 0;
++		error = copyin(arg, a, sizeof(a));
++		if (error == 0 && a[6] != 0) {
++			error = copyout(&ok, (user_addr_t)a[6], sizeof(ok));
++		}
++		return error;
++	}
++	case SWEET_AMFI_RESTRICTED_EXEC_STATUS:
++		return ENOENT;
++	default:
++		return 0;
+ 	}
+-	return error;
+ }
+ 
+ static int
 diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
 index c7b3a77..ca63728 100644
 --- a/iokit/Kernel/IOCPU.cpp
