@@ -103,6 +103,86 @@ for msg in (
     if msg in ct:
         ct = ct.replace(msg, f'if (sweet_hfs_link_note()) {{ {msg} }}', 1)
 cat_path.write_text(ct)
+
+# 4. Advertise unencrypted Class D (4) Data Protection semantics when !CONFIG_PROTECT on SWEET
+# so keybagd, dirs_cleaner, and containermanagerd succeed on fcntl(F_GET/SETPROTECTIONCLASS)
+# and setattrlist(ATTR_CMN_DATA_PROTECT_FLAGS).
+vnops_path = target / 'core' / 'hfs_vnops.c'
+vn = vnops_path.read_text()
+old_getattr_cp = (
+    '#if CONFIG_PROTECT\n'
+    '\tif (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {\n'
+    '    \t\tvap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;\n'
+    '    \t\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '    \t} \t\n'
+    '#endif'
+)
+new_getattr_cp = (
+    '#if CONFIG_PROTECT\n'
+    '\tif (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {\n'
+    '    \t\tvap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;\n'
+    '    \t\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '    \t} \t\n'
+    '#elif defined(ARM64_BOARD_CONFIG_SWEET)\n'
+    '\tif (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {\n'
+    '\t\tvap->va_dataprotect_class = 4; /* PROTECTION_CLASS_D */\n'
+    '\t\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '\t}\n'
+    '#endif'
+)
+old_setattr_cp = (
+    '#if CONFIG_PROTECT\n'
+    '\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '\tif (!error && VATTR_IS_ACTIVE(vap, va_dataprotect_class))\n'
+    '\t\terror = cp_vnode_setclass(vp, vap->va_dataprotect_class);\n'
+    '#endif'
+)
+new_setattr_cp = (
+    '#if CONFIG_PROTECT\n'
+    '\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '\tif (!error && VATTR_IS_ACTIVE(vap, va_dataprotect_class))\n'
+    '\t\terror = cp_vnode_setclass(vp, vap->va_dataprotect_class);\n'
+    '#elif defined(ARM64_BOARD_CONFIG_SWEET)\n'
+    '\tVATTR_SET_SUPPORTED(vap, va_dataprotect_class);\n'
+    '#endif'
+)
+if old_getattr_cp not in vn or old_setattr_cp not in vn:
+    raise SystemExit(f'HFS CONFIG_PROTECT blocks not found in {vnops_path}')
+vn = vn.replace(old_getattr_cp, new_getattr_cp, 1).replace(old_setattr_cp, new_setattr_cp, 1)
+vnops_path.write_text(vn)
+
+vt = vfsutils.read_text()
+old_mnt_cp = (
+    '#else\n'
+    '\t\t/* If CONFIG_PROTECT not built, ignore CP */\n'
+    '\t\tvfs_clearflags(hfsmp->hfs_mp, MNT_CPROTECT);\t\n'
+    '#endif'
+)
+new_mnt_cp = (
+    '#elif defined(ARM64_BOARD_CONFIG_SWEET)\n'
+    '\t\tvfs_setflags(hfsmp->hfs_mp, MNT_CPROTECT);\n'
+    '#else\n'
+    '\t\t/* If CONFIG_PROTECT not built, ignore CP */\n'
+    '\t\tvfs_clearflags(hfsmp->hfs_mp, MNT_CPROTECT);\t\n'
+    '#endif\n'
+    '\t} else {\n'
+    '#if defined(ARM64_BOARD_CONFIG_SWEET) && !CONFIG_PROTECT\n'
+    '\t\tvfs_setflags(hfsmp->hfs_mp, MNT_CPROTECT);\n'
+    '#endif'
+)
+if old_mnt_cp not in vt:
+    raise SystemExit(f'HFS MNT_CPROTECT block not found in {vfsutils}')
+vfsutils.write_text(vt.replace(old_mnt_cp, new_mnt_cp, 1))
+
+vfsops_path = target / 'core' / 'hfs_vfsops.c'
+vo = vfsops_path.read_text()
+old_vo1 = '#if CONFIG_PROTECT\n        \tattrp->validattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;\n#endif // CONFIG_PROTECT'
+new_vo1 = '#if CONFIG_PROTECT || defined(ARM64_BOARD_CONFIG_SWEET)\n        \tattrp->validattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;\n#endif // CONFIG_PROTECT'
+old_vo2 = '#if CONFIG_PROTECT\n\t\tattrp->nativeattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;\n#endif // CONFIG_PROTECT'
+new_vo2 = '#if CONFIG_PROTECT || defined(ARM64_BOARD_CONFIG_SWEET)\n\t\tattrp->nativeattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;\n#endif // CONFIG_PROTECT'
+if old_vo1 not in vo or old_vo2 not in vo:
+    raise SystemExit(f'HFS ATTR_CMN_DATA_PROTECT_FLAGS blocks not found in {vfsops_path}')
+vfsops_path.write_text(vo.replace(old_vo1, new_vo1, 1).replace(old_vo2, new_vo2, 1))
 PY
 
 if command -v xcrun >/dev/null 2>&1; then

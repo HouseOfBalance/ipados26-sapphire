@@ -51,8 +51,8 @@ if [[ -z $gpu_delay ]]; then
 	if [[ -n $autoreboot_args ]]; then gpu_delay=2; else gpu_delay=5; fi
 fi
 case $gpu_mode in
-gpu) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=2 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
-metal-stub) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=1 sweetgl=1 sweet_glload=1 gpu_div=1 sweetfb_direct=0 gpu_mhz=1260 glwait=0" ;;
+gpu) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=2 sweetgl=1 sweet_glload=1 gpu_div=2 sweetfb_direct=0 gpu_mhz=0 glwait=0" ;;
+metal-stub) gpu_args="gpu=3 gpu_delay=$gpu_delay gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetmetal=1 sweetgl=1 sweet_glload=1 gpu_div=2 sweetfb_direct=0 gpu_mhz=0 glwait=0" ;;
 *) gpu_args="sweetmetal=0 sweetgl=0 sweet_glload=0" ;;
 esac
 
@@ -79,7 +79,7 @@ python3 tools/ipados26_mkadt.py shim/out/ipados26-sapphire.adt --highmem \
 # Default: CPU rendering first (sweetmetal=0 sweetgl=0 sweet_glload=0) at native 1080x2400 (sweetfb_native=1);
 # pass --gpu for Adreno 610 + Tweaks!
 python3 tools/mkpayload.py "$kernel" shim/out/ipados26-sapphire.adt shim/out/payload-ipados26.bin \
-	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 ufsroot=$ufsroot unentitled_ios_sim_launch=1 ignition_level=1 $rw launchd_unsecure_cache=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 fips_mode=4 wdt=-1 ufslogsecs=1 $con sweettouch_rx=8640 sweettouch_ry=9600 sweettouchdelay=10 sweetusb=2 modem=0 wifi=1 sweetfb_native=1 sweetfb_hz=120 $gpu_args sweetbl=0 sweet_splash=0 $autoreboot_args $extra"
+	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 ufsroot=$ufsroot unentitled_ios_sim_launch=1 ignition_level=1 $rw launchd_unsecure_cache=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 fips_mode=4 wdt=-1 ufslogsecs=1 $con sweettouch_rx=8640 sweettouch_ry=9600 sweettouchdelay=10 sweetusb=2 modem=0 wifi=1 sweetfb_native=1 sweetfb_hz=120 sweetcpufreq=0 $gpu_args sweetbl=0 sweet_splash=0 $autoreboot_args $extra"
 
 shim/build.sh ../shim/out/payload-ipados26.bin
 [[ $out == "$repo/shim/out/shim-boot.img" ]] || cp shim/out/shim-boot.img "$out"

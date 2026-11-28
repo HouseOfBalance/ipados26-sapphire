@@ -1,3 +1,16 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 21e8e6e..caee79c 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -44,7 +44,7 @@ void sweet_cpufreq_touch_boost(void);
+ #define CPUFREQ_FREQ_LUT        0x110u
+ #define CPUFREQ_LUT_ROW         0x20u
+ #define CPUFREQ_PERF_STATE      0x920u
+-#define CPUFREQ_LUT_MAX         40
++#define CPUFREQ_LUT_MAX         12
+ 
+ #define TSENS0_SROT_PA          0x04410000u
+ #define TSENS0_TM_PA            0x04411000u
 diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
 index 0628506..7ed5a92 100644
 --- a/bsd/dev/sweet_reboot.c
@@ -318,21 +331,39 @@ index 35be399..71991cb 100644
  #include <kern/locks.h>
  #include <sys/kpi_mbuf.h>
 diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
-index c1c3929..e3d0652 100644
+index c1c3929..318b81c 100644
 --- a/bsd/kern/kern_cs.c
 +++ b/bsd/kern/kern_cs.c
-@@ -286,6 +286,11 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+@@ -285,11 +285,24 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 		proc_csflags_update(p, flags);
  	} else {
  		if (flags & CS_VALID) {
- 			flags &= ~CS_VALID;
+-			flags &= ~CS_VALID;
+-			cs_procs_invalidated++;
+-			verbose = 1;
+-			proc_csflags_update(p, flags);
+-			cs_process_invalidated(NULL);
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +			if (!send_kill) {
-+				flags |= CS_DEBUGGED;
-+			}
++				static int sweet_cs_page_logs;
++				flags |= CS_DEBUGGED | CS_VALID;
++				if (sweet_cs_page_logs < 8) {
++					sweet_cs_page_logs++;
++					verbose = 1;
++				}
++				proc_csflags_update(p, flags);
++			} else
 +#endif
- 			cs_procs_invalidated++;
- 			verbose = 1;
++			{
++				flags &= ~CS_VALID;
++				cs_procs_invalidated++;
++				verbose = 1;
++				proc_csflags_update(p, flags);
++				cs_process_invalidated(NULL);
++			}
+ 		} else {
  			proc_csflags_update(p, flags);
+ 		}
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index e7bf9a3..8120341 100644
 --- a/bsd/kern/kern_exec.c
@@ -381,10 +412,22 @@ index e7bf9a3..8120341 100644
  
  #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
 diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
-index f00256b..632e716 100644
+index f00256b..1a0d039 100644
 --- a/bsd/kern/kern_proc.c
 +++ b/bsd/kern/kern_proc.c
-@@ -3674,6 +3674,9 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+@@ -3638,6 +3638,11 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		if ((proc_getcsflags(pt) & CS_FORCED_LV) == CS_FORCED_LV) {
+ 			retflags &= (~CS_REQUIRE_LV);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if ((retflags & CS_SIGNED) && !(retflags & CS_KILLED)) {
++			retflags |= CS_VALID;
++		}
++#endif
+ 		proc_unlock(pt);
+ 
+ 		if (uaddr != USER_ADDR_NULL) {
+@@ -3674,6 +3679,9 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
  		break;
  
  	case CS_OPS_MARKHARD:
@@ -394,7 +437,7 @@ index f00256b..632e716 100644
  		proc_lock(pt);
  		proc_csflags_set(pt, CS_HARD);
  		if ((proc_getcsflags(pt) & CS_VALID) == 0) {
-@@ -3685,8 +3688,12 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+@@ -3685,8 +3693,12 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
  			proc_unlock(pt);
  		}
  		break;
@@ -407,7 +450,7 @@ index f00256b..632e716 100644
  		proc_lock(pt);
  		proc_csflags_set(pt, CS_KILL);
  		if ((proc_getcsflags(pt) & CS_VALID) == 0) {
-@@ -3696,6 +3703,7 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+@@ -3696,6 +3708,7 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
  			proc_unlock(pt);
  		}
  		break;
@@ -415,7 +458,7 @@ index f00256b..632e716 100644
  
  	case CS_OPS_PIDOFFSET:
  		toff = pt->p_textoff;
-@@ -3856,8 +3864,15 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+@@ -3856,8 +3869,15 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
  		    CS_REQUIRE_LV |
  		    CS_ENFORCEMENT | CS_EXEC_SET_ENFORCEMENT;
  
@@ -448,10 +491,18 @@ index 1f1e11c..5585b47 100644
  		if (error == 0) {
  			*retval = sizeof(uint32_t);
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index a201ae4..7294979 100644
+index a201ae4..3deaa3d 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -55,6 +55,8 @@ SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CT
+@@ -24,6 +24,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <kern/locks.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+@@ -55,6 +56,8 @@ SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CT
      &sweet_amfi_developer_mode, "developer mode (on: nothing is restricted here)");
  SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, qa_root_certs_allowed, CTLFLAG_RD | CTLFLAG_LOCKED,
      &sweet_amfi_qa_root_certs, "");
@@ -460,7 +511,7 @@ index a201ae4..7294979 100644
  
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
-@@ -341,7 +343,7 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+@@ -341,7 +344,7 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
   * op 6, extension consume ({u64 token, u64 len, u64 out handle}): succeeds
   *   with handle 1 (sandbox_extension_consume() returns it; -1 means failure).
   */
@@ -469,7 +520,7 @@ index a201ae4..7294979 100644
  
  #define SWEET_SB_TOKEN_MAX      2048    /* libsystem_sandbox's output buffer */
  
-@@ -359,7 +361,12 @@ sweet_sandbox_container_path(user_addr_t arg)
+@@ -359,7 +362,12 @@ sweet_sandbox_container_path(user_addr_t arg)
  	if (error) {
  		return error;
  	}
@@ -483,7 +534,7 @@ index a201ae4..7294979 100644
  		uint32_t token[8];
  		error = copyin((user_addr_t)a[0], token, sizeof(token));
  		if (error) {
-@@ -449,14 +456,125 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+@@ -449,14 +457,240 @@ sweet_sandbox_extension_consume(user_addr_t arg)
  	return error;
  }
  
@@ -517,32 +568,147 @@ index a201ae4..7294979 100644
 +	return 0;
 +}
 +
++#define SWEET_SB_USER_STATE_MAX         (256U * 1024U)
++static LCK_GRP_DECLARE(sweet_sb_ustate_grp, "sweet_sb_ustate");
++static LCK_MTX_DECLARE(sweet_sb_ustate_lock, &sweet_sb_ustate_grp);
++static uint8_t *sweet_sb_ustate_buf;
++static size_t sweet_sb_ustate_cap;
++static size_t sweet_sb_ustate_len;      /* payload bytes excluding 8-byte zero terminator */
++
++static int
++sweet_sandbox_user_state_send(user_addr_t arg)
++{
++	/*
++	 * _sandbox_user_state_item_buffer_send(packbuff):
++	 * a[0] = bytes, a[1] = size (multiple of 8, ending with an 8-byte zero
++	 * terminator). Concatenate item streams in-kernel so containermanagerd
++	 * reads back all user-state items pushed by containermanagerd_system.
++	 */
++	uint64_t a[2] = { 0, 0 };
++	uint8_t *in_buf = NULL;
++	size_t in_size, payload_len;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	if (a[0] == 0 || a[1] < 8 || (a[1] & 7ULL) != 0 || a[1] > SWEET_SB_USER_STATE_MAX) {
++		return 0;
++	}
++	in_size = (size_t)a[1];
++	in_buf = kalloc_data(in_size, Z_WAITOK | Z_ZERO);
++	if (in_buf == NULL) {
++		return ENOMEM;
++	}
++	error = copyin((user_addr_t)a[0], in_buf, in_size);
++	if (error != 0) {
++		kfree_data(in_buf, in_size);
++		return error;
++	}
++	payload_len = in_size;
++	while (payload_len >= 8) {
++		uint64_t tail = 0;
++		memcpy(&tail, in_buf + payload_len - 8, sizeof(tail));
++		if (tail != 0) {
++			break;
++		}
++		payload_len -= 8;
++	}
++	if (payload_len == 0) {
++		kfree_data(in_buf, in_size);
++		return 0;
++	}
++
++	lck_mtx_lock(&sweet_sb_ustate_lock);
++	if (sweet_sb_ustate_len + payload_len + 8 > SWEET_SB_USER_STATE_MAX) {
++		/* Reclaim stale entries if cumulative updates exceed 256 KiB. */
++		sweet_sb_ustate_len = 0;
++	}
++	size_t needed = sweet_sb_ustate_len + payload_len + 8;
++	if (needed > sweet_sb_ustate_cap) {
++		size_t new_cap = sweet_sb_ustate_cap ? sweet_sb_ustate_cap * 2 : 16384U;
++		while (new_cap < needed) {
++			new_cap *= 2;
++		}
++		if (new_cap > SWEET_SB_USER_STATE_MAX) {
++			new_cap = SWEET_SB_USER_STATE_MAX;
++		}
++		uint8_t *new_buf = kalloc_data(new_cap, Z_WAITOK | Z_ZERO);
++		if (new_buf == NULL) {
++			lck_mtx_unlock(&sweet_sb_ustate_lock);
++			kfree_data(in_buf, in_size);
++			return ENOMEM;
++		}
++		if (sweet_sb_ustate_buf != NULL) {
++			if (sweet_sb_ustate_len > 0) {
++				memcpy(new_buf, sweet_sb_ustate_buf, sweet_sb_ustate_len);
++			}
++			kfree_data(sweet_sb_ustate_buf, sweet_sb_ustate_cap);
++		}
++		sweet_sb_ustate_buf = new_buf;
++		sweet_sb_ustate_cap = new_cap;
++	}
++	memcpy(sweet_sb_ustate_buf + sweet_sb_ustate_len, in_buf, payload_len);
++	sweet_sb_ustate_len += payload_len;
++	bzero(sweet_sb_ustate_buf + sweet_sb_ustate_len, 8);
++	lck_mtx_unlock(&sweet_sb_ustate_lock);
++
++	kfree_data(in_buf, in_size);
++	return 0;
++}
++
 +static int
 +sweet_sandbox_inspect_subsystem(user_addr_t arg)
 +{
 +	/*
 +	 * _sb_inspect_subsystem(subsys, uid, buf, buflen, &out_len, flags):
 +	 * Caller leaves out_len uninitialized on the stack and on the first probe
-+	 * passes buf == NULL, buflen == 0 expecting ERANGE with out_len == 0 before
++	 * passes buf == NULL, buflen == 0 expecting ERANGE with out_len set before
 +	 * retrying with malloc(out_len + 0x1000).
 +	 */
 +	uint64_t a[6] = { 0 };
 +	uint64_t out_len = 0;
++	uint8_t *snap = NULL;
++	size_t snap_len = 0;
 +	int error = copyin(arg, a, sizeof(a));
 +
 +	if (error != 0) {
 +		return error;
 +	}
++	if (a[0] == 2) {
++		lck_mtx_lock(&sweet_sb_ustate_lock);
++		if (sweet_sb_ustate_buf != NULL && sweet_sb_ustate_len > 0) {
++			snap_len = sweet_sb_ustate_len + 8;
++			out_len = snap_len;
++			if (a[2] != 0 && a[3] >= out_len) {
++				snap = kalloc_data(snap_len, Z_WAITOK | Z_ZERO);
++				if (snap != NULL) {
++					memcpy(snap, sweet_sb_ustate_buf, snap_len);
++				}
++			}
++		}
++		lck_mtx_unlock(&sweet_sb_ustate_lock);
++	}
 +	if (a[4] != 0) {
 +		error = copyout(&out_len, (user_addr_t)a[4], sizeof(out_len));
 +		if (error != 0) {
++			if (snap != NULL) {
++				kfree_data(snap, snap_len);
++			}
 +			return error;
 +		}
 +	}
-+	if (a[2] == 0) {
++	if (a[2] == 0 || a[3] < out_len) {
++		if (snap != NULL) {
++			kfree_data(snap, snap_len);
++		}
 +		return ERANGE;
 +	}
-+	return 0;
++	if (snap != NULL && snap_len > 0) {
++		error = copyout(snap, (user_addr_t)a[2], snap_len);
++		kfree_data(snap, snap_len);
++	}
++	return error;
 +}
 +
 +static int
@@ -614,12 +780,14 @@ index a201ae4..7294979 100644
  	}
  	switch (call) {
  	case 4:         /* container path (pid / audit token) */
-@@ -465,47 +583,84 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+@@ -465,47 +699,86 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  		return sweet_sandbox_extension_issue(arg);
  	case 6:         /* extension consume */
  		return sweet_sandbox_extension_consume(arg);
 -	case 0x43:      /* container expected */
 -		return ENOENT;
++	case 0x0f:      /* _sandbox_user_state_item_buffer_send */
++		return sweet_sandbox_user_state_send(arg);
 +	case 0x10:      /* _sb_inspect_subsystem */
 +		return sweet_sandbox_inspect_subsystem(arg);
 +	case 0x1c:      /* sandbox_reference_retain_by_audit_token */
@@ -720,14 +888,15 @@ index a201ae4..7294979 100644
  }
  
  static int
-@@ -541,7 +696,9 @@ static int sweet_priv_logged_count;
+@@ -541,7 +814,10 @@ static int sweet_priv_logged_count;
  static int
  sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
  {
 -	if (priv == PRIV_WORK_INTERVAL) {
 +	if (priv == PRIV_WORK_INTERVAL ||
 +	    priv == PRIV_GLOBAL_PROC_INFO ||
-+	    priv == PRIV_VM_FOOTPRINT_LIMIT) {
++	    priv == PRIV_VM_FOOTPRINT_LIMIT ||
++	    (priv >= 10000 && priv <= 10999)) {
  		return 0;
  	}
  	char name[20];
@@ -820,7 +989,7 @@ index 96c557b..1b92d41 100644
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
  		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 4141f6e..ceb1ed1 100644
+index 4141f6e..854be90 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -224,6 +224,7 @@ SweetLowBuf::alloc(size_t len)
@@ -840,6 +1009,28 @@ index 4141f6e..ceb1ed1 100644
  	uint64_t      fPhys;
  	uint32_t      fWidth, fHeight, fRowBytes;
  	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+@@ -2583,12 +2582,17 @@ void
+ AppleCLCD::setRateHz(uint32_t hz)
+ {
+ 	uint32_t clamped = hz >= 240 ? 240 : hz >= 180 ? 180 : hz >= 120 ? 120 : hz >= 90 ? 90 : 60;
++	bool changed = false;
+ 	IOLockLock(fLock);
+-	fRateHz = clamped;
+-	fNextVsync = 0;
++	if (fRateHz != clamped) {
++		fRateHz = clamped;
++		fNextVsync = 0;
++		changed = true;
++	}
+ 	IOLockUnlock(fLock);
+-	publishModes();
+-	IOLog("SWEET FB: kern.sweet_fb_hz -> %u Hz (respring backboardd to apply)\n", clamped);
++	if (changed) {
++		IOLog("SWEET FB: kern.sweet_fb_hz -> %u Hz\n", clamped);
++	}
+ }
+ static int
+ sweet_fb_hz_sysctl SYSCTL_HANDLER_ARGS
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index a46c3e2..b8dece8 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
