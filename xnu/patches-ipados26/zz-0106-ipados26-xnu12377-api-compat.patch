@@ -953,6 +953,21 @@ index 917ecd5..0b4585a 100644
  			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
  		} else {
  #if HAS_FEAT_XS
+diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+new file mode 100644
+index 0000000..963cdc1
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
++ * in Apple's closed per-SoC library. It implements the AMCC read-only region
++ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
++ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
 diff --git a/osfmk/arm64/bzero.s b/osfmk/arm64/bzero.s
 index 0d3934b..4d61fc5 100644
 --- a/osfmk/arm64/bzero.s
