@@ -1,3 +1,142 @@
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 0628506..1d97d56 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -3,16 +3,45 @@
+  * kern.sweet_reboot_mode = 0 system (Android, from the boot partition), 1 recovery, 2 bootloader
+  * (fastboot, the default: iOS is only ever started with fastboot boot); boot-arg sweet_reboot=N
+  * sets the default.
++ *
++ * boot-arg sweet_autoreboot=SECS (sysctl kern.sweet_autoreboot): starts an independent Mach
++ * timer thread as soon as interrupts come up that flushes SWEETLOG to iosroot and resets via
++ * PSCI after SECS seconds (or 5s after any kernel panic), returning to Android automatically.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
++extern void sweet_log_sync(unsigned max_ms);
++extern uint64_t sweet_log_position(void);
++extern int sweet_spmi_set_reboot_reason(unsigned mode);
++
+ static int sweet_reboot_mode = -1;
++static uint32_t sweet_autoreboot_secs = 0;
++static int sweet_autoreboot_chan;
++static bool sweet_autoreboot_started = false;
++
+ int sweet_reboot_mode_get(void);
+ void sweet_reboot_mode_set(int mode);
++void sweet_autoreboot_init(void);
++void sweet_panic_autoreboot(void);
++
++static void __attribute__((noreturn))
++sweet_psci_reset_now(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL; /* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
+ 
+ /* 0299: Volume up held during the boot screen (sweet_keys.c): the next restart goes to recovery */
+ void
+@@ -34,6 +63,80 @@ sweet_reboot_mode_get(void)
+ 	return sweet_reboot_mode;
+ }
+ 
++static void
++sweet_autoreboot_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t elapsed = 0;
++
++	printf("SWEET AUTOREBOOT: armed for %u seconds (target mode %d)\n",
++	    sweet_autoreboot_secs, sweet_reboot_mode_get());
++	for (;;) {
++		uint32_t limit = sweet_autoreboot_secs;
++		if (limit == 0) {
++			printf("SWEET AUTOREBOOT: disarmed via sysctl at t=%us\n", elapsed);
++			return;
++		}
++		if (elapsed >= limit) {
++			int mode = sweet_reboot_mode_get();
++			printf("\n=== SWEET AUTOREBOOT: %u seconds reached -- syncing SWEETLOG & rebooting (mode %d) ===\n",
++			    elapsed, mode);
++			sweet_log_sync(2000);
++			(void)sweet_spmi_set_reboot_reason((unsigned)mode);
++			delay(20000);
++			sweet_psci_reset_now();
++		}
++		uint64_t deadline = 0;
++		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&sweet_autoreboot_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		elapsed++;
++		if ((elapsed % 5u) == 0) {
++			printf("SWEET AUTOREBOOT: t=%us/%us (log=%llu bytes)\n",
++			    elapsed, sweet_autoreboot_secs, (unsigned long long)sweet_log_position());
++		}
++	}
++}
++
++void
++sweet_autoreboot_init(void)
++{
++	thread_t thread = THREAD_NULL;
++	uint32_t secs = 0;
++
++	if (sweet_autoreboot_started) {
++		return;
++	}
++	sweet_autoreboot_started = true;
++	if (!PE_parse_boot_argn("sweet_autoreboot", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	if (secs > 3600) {
++		secs = 3600;
++	}
++	sweet_autoreboot_secs = secs;
++	if (kernel_thread_start(sweet_autoreboot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++void
++sweet_panic_autoreboot(void)
++{
++	uint32_t secs = sweet_autoreboot_secs;
++
++	if (secs == 0) {
++		(void)PE_parse_boot_argn("sweet_autoreboot", &secs, sizeof(secs));
++	}
++	if (secs == 0) {
++		return;
++	}
++	printf("SWEET PANIC: sweet_autoreboot=%u active -- resetting to Android in 5s\n", secs);
++	for (int i = 0; i < 5000; i++) {
++		delay(1000);
++	}
++	sweet_psci_reset_now();
++}
++
+ static int
+ sysctl_sweet_reboot_mode SYSCTL_HANDLER_ARGS
+ {
+@@ -53,4 +156,7 @@ sysctl_sweet_reboot_mode SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_reboot_mode, "I", "where a restart goes: 0 system, 1 recovery, 2 bootloader");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_autoreboot, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_autoreboot_secs, 0, "auto-reboot countdown in seconds (0 = disarmed)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_slot.h b/bsd/dev/sweet_slot.h
 index 1b51a8e..3b9170e 100644
 --- a/bsd/dev/sweet_slot.h
@@ -123,6 +262,20 @@ index 71a85fa..d8d1d45 100644
  	arm_slide_rebase_and_sign_image();
  
  	/* If kernel integrity is supported, use a constant copy of the boot args. */
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 0e4d8ed..56b30b1 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -929,7 +929,9 @@ SavePanicInfo(
+ 	 * now: put the ring on the disk first (bsd/dev/sweet_ufs.c).
+ 	 */
+ 	extern void sweet_log_panic_flush(void);
++	extern void sweet_panic_autoreboot(void);
+ 	sweet_log_panic_flush();
++	sweet_panic_autoreboot();
+ #endif
+ 	/*
+ 	 * This should be initialized by the time we get here, but
 diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
 new file mode 100644
 index 0000000..963cdc1
@@ -216,6 +369,31 @@ index c244b1b..41d2b05 100644
  
  #include <Tightbeam/tightbeam.h>
  
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 5745aa9..d1849f8 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -684,6 +684,10 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
+  * Now running in a thread.  Kick off other services,
+  * invoke user bootstrap, enter pageout loop.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_autoreboot_init(void);
++#endif
++
+ static void
+ kernel_bootstrap_thread(void)
+ {
+@@ -799,6 +803,9 @@ kernel_bootstrap_thread(void)
+ 	ml_spin_debug_clear_self();
+ #endif
+ 	(void) spllo();         /* Allow interruptions */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_autoreboot_init();
++#endif
+ 
+ 	/*
+ 	 * This will start displaying progress to the user, start as early as possible
 diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
 index f0af7d2..0a0702f 100644
 --- a/osfmk/prng/entropy.c
