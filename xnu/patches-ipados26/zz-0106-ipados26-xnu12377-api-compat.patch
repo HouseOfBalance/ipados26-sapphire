@@ -916,6 +916,23 @@ index 67a2414..aee3ee3 100644
  					error = EPERM;
  					KAUTH_DEBUG("  DENIED - user attempt to set illegal flag(s)");
  					goto out;
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 2bcf575..bd3df2c 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -1232,8 +1232,12 @@ mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
+ 		 */
+ 		if ((mp->mnt_flag & MNT_CPROTECT) &&
+ 		    ((flags & MNT_CPROTECT) == 0)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			flags |= MNT_CPROTECT;
++#else
+ 			error = EINVAL;
+ 			goto out1;
++#endif
+ 		}
+ 
+ 		/*
 diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
 index c7b3a77..ca63728 100644
 --- a/iokit/Kernel/IOCPU.cpp
